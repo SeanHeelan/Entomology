@@ -1,0 +1,325 @@
+Description:
+------------
+Summary
+-------
+
+ZEND_FUNCTION(set_exception_handler) uses the zend_ptr_stack_XXX functions to
+manage stored zvals for user specified exception handlers. The
+zend_ptr_stack_XXX functions are not reference-count aware and the reference
+count of the zval is not incremented prior to it being added to the stack.
+
+As the zval representing the handler is allocated internally in the
+interpreter, the assumption here seems to be that the use of this storage
+mechanism is safe as other references to it cannot be obtained. As it turns
+out, this isn't the case.
+
+As explained below, it is possible to gain another reference to the zval by
+building a backtrace from within the exception handler, thus adding a reference
+to the exception handler to the array representing the backtrace. A call to
+zend_ptr_stack_clean can then be triggered which, as mentioned, doesn't take
+into account other references and simply deallocates the object. After this
+point the user can trigger a reuse of the zval through the obtained reference,
+resulting in a use-after-free condition.
+
+Reported 2014-01-22. URL: https://bugs.php.net/bug.php?id=66549
+
+Impact
+------
+
+This bug results in a use-after-free condition triggered during the execution of
+the shutdown_executor function. While exploitation is not likely to be as
+straightforward as a standard use-after-free triggered by a function that
+directly returns control to a user script, this can probably be overcome by
+registering object desctructors that will be invoked after the free and prior to
+the reuse. The likely outcome is the execution of arbitrary, attacker specified,
+code.
+
+Patch Details
+-------------
+
+The patch moves the call to zend_ptr_stack_clean until after any other
+references have been released. At this point we know no other live references
+to the zval exist and thus it is safe for zend_ptr_stack_clean to free the
+memory.
+
+Bug Details
+-----------
+
+See the attached file, trigger.php, for a demonstration of the issue. The key
+to the problem lies with the method used to save previous exception handlers in
+ZEND_FUNCTION(set_exception_handler).
+
+File : Zend/zend_builtin_functions.c
+
+1590 ZEND_FUNCTION(set_exception_handler)
+1591 {
+1592         zval *exception_handler;
+1593         char *exception_handler_name = NULL;
+1594
+
+...
+
+1609         if (EG(user_exception_handler)) {
+1610                 RETVAL_ZVAL(EG(user_exception_handler), 1, 0);
+1611
+1612                 zend_ptr_stack_push(&EG(user_exception_handlers), EG(user_exception_handler));
+1613         }
+1614
+
+...
+
+1620         ALLOC_ZVAL(EG(user_exception_handler));
+1621         MAKE_COPY_ZVAL(&exception_handler, EG(user_exception_handler))
+1622 }
+
+On the first call to set_exception_handler lines 1610-1612 are skipped. On line
+1620 a new zval is allocated and initialised from whatever exception handler
+has been specified by the user. A pointer to it is then stored in
+EG(user_exception_handler). In trigger.php the specified exception handler is an
+object, and thus EG(user_exception_handler) will then refer to a zval with the
+type IS_OBJECT (5) and a reference count of 1.
+
+(gdb) p/x *executor_globals.user_exception_handler
+$1 = {value = {lval = 0x2, dval = 0x0, str = {val = 0x2, len = 0x886e9a0}, ht = 0x2, obj = {handle = 0x2, handlers = 0x886e9a0}}, refcount__gc = 0x1, type = 0x5, is_ref__gc = 0x0}
+
+If set_exception_handler is called again, with a non-empty exception handler,
+this zval pointer in EG(user_exception_handler) is pushed to the
+EG(user_exception_handlers) stack.
+
+The zend_ptr_stack_* functions are not designed to take into account any
+reference counting semantics for the items on the stacks that they manage. For
+example, if a call to zend_ptr_stack_clean is triggered then every item on the
+specified stack will simply be deallocated, regardless of whether its reference
+count is greater than 1 or not.
+
+File : Zend/zend_ptr_stack.c
+
+ 94 ZEND_API void zend_ptr_stack_clean(zend_ptr_stack *stack, void (*func)(void *), zend_bool free_elements)
+ 95 {
+ 96         zend_ptr_stack_apply(stack, func);
+ 97         if (free_elements) {
+ 98                 int i = stack->top;
+ 99
+100                 while (--i >= 0) {
+101                         pefree(stack->elements[i], stack->persistent);
+102                 }
+103         }
+104         stack->top = 0;
+105         stack->top_element = stack->elements;
+106 }
+
+The only call to this function, taking the EG(user_exception_handlers) stack as an
+argument, is in shutdown_executor.
+
+File : Zend/zend_execute_API.c
+
+227 void shutdown_executor(TSRMLS_D) /* {{{ */
+228 {
+
+...
+
+269                 zend_ptr_stack_clean(&EG(user_exception_handlers), ZVAL_DESTRUCTOR, 1);
+
+The use of zend_ptr_stack_* to manage the exception handler zvals is not
+problematic unless a user can achieve both of the following:
+
+1. Before the call to zend_ptr_stack_clean (on line 269 above) acquire a
+reference to the zval representing the stored exception handler
+
+2. After the call to zend_ptr_stack_clean make use of this reference, which will
+now be to freed memory.
+
+As it turns out, both are achievable.
+
+A reference to the zval allocated on line 1620 of
+ZEND_FUNCTION(set_exception_handler) is not directly accessible. However, we
+can make use of the debug_backtrace function in order to get one for us.
+
+Internally, zend_fetch_debug_backtrace walks the current call stack and
+constructs an array representing the backtrace. A record of the call stack is
+kept via a linked list of zend_execute_data structures, with the structure
+representing the currently executing function stored in
+EG(current_execute_data). Prior to executing a user-specified exception handler
+the value in EG(current_execute_data) is updated via the data stored in
+EG(user_exception_handler). In the case where the exception handler is a method
+of an object, EG(current_execute_data)->object will be set to the value in
+EG(user_exception_handler). On lines 2324 and 2325 of the following code we can
+see a reference to this object being inserted into the stack_frame array, and
+then its reference count incremented.
+
+File : Zend/zend_builtin_functions.c
+
+2230 ZEND_API void zend_fetch_debug_backtrace(zval *return_value, int skip_last, int options, int limit TSRMLS_DC)
+2231 {
+2232         zend_execute_data *ptr, *skip;
+2233         int lineno, frameno = 0;
+2234         const char *function_name;
+2235         const char *filename;
+2236         const char *class_name;
+2237         const char *include_filename = NULL;
+2238         zval *stack_frame;
+2239
+2240         ptr = EG(current_execute_data);
+
+...
+
+2251
+2252         array_init(return_value);
+2253
+2254         while (ptr && (limit == 0 || frameno < limit)) {
+2255                 frameno++;
+2256                 MAKE_STD_ZVAL(stack_frame);
+2257                 array_init(stack_frame);
+2258
+
+...
+
+2298
+2299                 function_name = (ptr->function_state.function->common.scope &&
+
+...
+
+2307
+2308                 if (function_name) {
+2309                         add_assoc_string_ex(stack_frame, "function", sizeof("function"), (char*)function_name, 1);
+2310
+2311                         if (ptr->object && Z_TYPE_P(ptr->object) == IS_OBJECT) {
+
+...
+
+2322                                 if ((options & DEBUG_BACKTRACE_PROVIDE_OBJECT) != 0) {
+2323                                         add_assoc_zval_ex(stack_frame, "object", sizeof("object"), ptr->object);
+2324                                         Z_ADDREF_P(ptr->object);
+2325                                 }
+
+To gain a reference to the zval in EG(user_exception_handler) we therefore need
+to trigger a call to debug_backtrace() from within the specified handler, or a
+function called by it. By assigning the array resulting from debug_backtrace()
+to a variable it will be added to the global objects store. This will become
+useful when we later need to trigger a use of the freed zval.
+
+Once we have attained a reference to the zval we then need to get it added to
+the EG(user_exception_handlers) stack. As mentioned earlier, this is simply
+done by triggering another call to ZEND_FUNCTION(set_exception_handler).
+
+Following the above steps, demonstrated in trigger.php, the situation is as
+follows: The EG(user_exception_handlers) stack contains a zval pointer. This
+exact same zval pointer is also referenced via an object found in
+EG(objects_store). The final steps are to trigger the call to
+zend_ptr_stack_clean, thus freeing the zval, and then attempt to trigger a
+reuse via the reference in EG(objects_store). Both of these steps are trivially
+taken by simply triggering the call to shutdown_executor.
+
+File : Zend/zend_execute_API.c
+
+227 void shutdown_executor(TSRMLS_D) /* {{{ */
+228 {
+229         zend_try {
+...
+
+269                 zend_ptr_stack_clean(&EG(user_exception_handlers), ZVAL_DESTRUCTOR, 1);
+270         } zend_end_try();
+
+...
+
+291
+292         zend_try {
+293                 zend_objects_store_free_object_storage(&EG(objects_store) TSRMLS_CC);
+
+As discussed previously, line 269 will result in the zval being freed.  Line
+293 will recursively destroy each object referenced in EG(objects_store).  This
+includes the result of debug_backtrace(), which in turn includes a pointer to
+the freed zval. An attacker that can reallocate the buffer between these two
+points may be able to influence control flow during the reuse of the freed
+zval. The demonstration in trigger.php makes no such attempt and a segmentation
+fault occurs during the reuse, as several bytes of the zval are rewritten when
+it is returned to the allocator. The following gdb session demonstrates the
+above points.
+
+1. First call to ZEND_FUNCTION(set_exception_handler) - Sets
+EG(user_exception_handler) to a new zval
+
+======
+Breakpoint 2, zif_set_exception_handler (ht=1, return_value=0xb7c4a0fc, return_value_ptr=0xb7c2e1d4, this_ptr=0x0, return_value_used=0)
+    at /home/user/php/Zend/zend_builtin_functions.c:1593
+1593            char *exception_handler_name = NULL;
+(gdb) finish
+Run till exit from #0  zif_set_exception_handler (ht=1, return_value=0xb7c4a0fc, return_value_ptr=0xb7c2e1d4, this_ptr=0x0, return_value_used=0)
+    at /home/user/php/Zend/zend_builtin_functions.c:1593
+0x083a8289 in zend_do_fcall_common_helper_SPEC (execute_data=0xb7c2e210) at /home/user/php/Zend/zend_vm_execute.h:554
+554                                     fbc->internal_function.handler(opline->extended_value, ret->var.ptr, &ret->var.ptr, EX(object), RETURN_VALUE_USED(opline) TSRMLS_CC);
+(gdb) p/x executor_globals.user_exception_handler
+$97 = 0xb7c4a118
+======
+
+2. Exception handler is triggered and debug_backtrace() is used to grab a
+reference to the zval in EG(user_exception_handler)
+
+======
+Breakpoint 26, zend_fetch_debug_backtrace (return_value=0xb7c4b3c4, skip_last=0, options=1, limit=0) at /home/user/php/Zend/zend_builtin_functions.c:2324
+2324                                            Z_ADDREF_P(ptr->object);
+(gdb) p/x ptr->object
+$98 = 0xb7c4a118
+
+3. Second call to ZEND_FUNCTION(set_exception_handler) - Adds
+EG(user_exception_handler) to the EG(user_exception_handlers) stack
+
+1609            if (EG(user_exception_handler)) {
+(gdb)
+1610                    RETVAL_ZVAL(EG(user_exception_handler), 1, 0);
+(gdb)
+1612                    zend_ptr_stack_push(&EG(user_exception_handlers), EG(user_exception_handler));
+(gdb)
+1615            if (Z_TYPE_P(exception_handler) == IS_NULL) { /* unset user-defined handler */
+(gdb) p/x executor_globals.user_exception_handlers.elements[0]
+$101 = 0xb7c4a118
+======
+
+4. shutdown_executor calls zend_ptr_stack_clean, freeing the zval
+
+======
+269                     zend_ptr_stack_clean(&EG(user_exception_handlers), ZVAL_DESTRUCTOR, 1);
+(gdb) s
+zend_ptr_stack_clean (stack=0x8886650, func=0x837061b <_zval_dtor_wrapper>, free_elements=1 '\001') at /home/user/php/Zend/zend_ptr_stack.c:96
+96              zend_ptr_stack_apply(stack, func);
+(gdb) n
+97              if (free_elements) {
+(gdb)
+98                      int i = stack->top;
+(gdb)
+100                     while (--i >= 0) {
+(gdb) s
+101                             pefree(stack->elements[i], stack->persistent);
+(gdb)
+_efree (ptr=0xb7c4a118) at /home/user/php/Zend/zend_alloc.c:2436
+2436            if (UNEXPECTED(!AG(mm_heap)->use_zend_alloc)) {
+======
+
+5. shutdown_executor calls zend_objects_store_free_object_storage invoking the
+destructor of the backtrace array, and all its referenced objects
+
+======
+293                     zend_objects_store_free_object_storage(&EG(objects_store) TSRMLS_CC);
+(gdb) c
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x083924dc in gc_zval_possible_root (zv=0xb7c4a118) at /home/user/php/Zend/zend_gc.c:143
+143                     GC_ZOBJ_CHECK_POSSIBLE_ROOT(zv);
+(gdb) bt
+#0  0x083924dc in gc_zval_possible_root (zv=0xb7c4a118) at /home/user/php/Zend/zend_gc.c:143
+#1  0x08360ff8 in gc_zval_check_possible_root (z=0xb7c4a118) at /home/user/php/Zend/zend_gc.h:183
+#2  i_zval_ptr_dtor (zval_ptr=0xb7c4a118) at /home/user/php/Zend/zend_execute.h:86
+#3  _zval_ptr_dtor (zval_ptr=0xb7c49c5c) at /home/user/php/Zend/zend_execute_API.c:427
+
+...
+
+#34 0x08399418 in zend_object_std_dtor (object=0xb7c4a9b8) at /home/user/php/Zend/zend_objects.c:54
+#35 0x0839971f in zend_objects_free_object_storage (object=0xb7c4a9b8) at /home/user/php/Zend/zend_objects.c:137
+#36 0x083a0f52 in zend_objects_store_free_object_storage (objects=0x8886680) at /home/user/php/Zend/zend_objects_API.c:97
+#37 0x08360c30 in shutdown_executor () at /home/user/php/Zend/zend_execute_API.c:293
+#38 0x0837201a in zend_deactivate () at /home/user/php/Zend/zend.c:953
+#39 0x082ff2fd in php_request_shutdown (dummy=0x0) at /home/user/php/main/main.c:1807
+#40 0x0845a6a4 in do_cli (argc=2, argv=0x8889238) at /home/user/php/sapi/cli/php_cli.c:1177
+#41 0x0845aebe in main (argc=2, argv=0x8889238) at /home/user/php/sapi/cli/php_cli.c:1378
+======

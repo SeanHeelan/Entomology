@@ -1,0 +1,133 @@
+Description:
+------------
+Summary
+-------
+
+The xml_parser_set_option function allows one to specify a number of bytes to
+skip beyond the start of a tag, before passing this tag to various
+user-specified handlers. The value is not sanitised in any way and thus can be
+manipulated to read data at arbitrary offsets from the tag.
+
+Reported 2014-01-22. URL: https://bugs.php.net/bug.php?id=66547
+
+Impact
+------
+
+The impact of this bug is an information leak. A malicious user can read data
+at arbitrary offsets from an allocated heap chunk. i.e. it's useful for
+defeating ASLR.
+
+Patch Details
+-------------
+
+The patch (in a comment below) updates each location that makes use of the
+user-specified offset to ensure that it does not result in an out of bounds
+pointer.
+
+Bug Details
+-----------
+
+The trigger file demonstrates this issue by specifying -4 as
+the offset. As shown in the attached GDB session,
+zif_xml_parser_set_option will store this value in the toffset attribute of
+the xml_parser object (line 1634).
+
+File : ext/xml/php_xml.h
+
+46 typedef struct {
+	...
+
+81         int toffset;
+	...
+
+90 } xml_parser;
+
+File : ext/xml/xml.c
+
+1616 PHP_FUNCTION(xml_parser_set_option)
+1617 {
+1618         xml_parser *parser;
+1619         zval *pind, **val;
+1620         long opt;
+1621
+1622         if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "rlZ", &pind, &opt, &val) == FAILURE) {
+1623                 return;
+1624         }
+1625         ZEND_FETCH_RESOURCE(parser,xml_parser *, &pind, -1, "XML Parser", le_xml_parser);
+1626
+1627         switch (opt) {
+1628                 case PHP_XML_OPTION_CASE_FOLDING:
+1629                         convert_to_long_ex(val);
+1630                         parser->case_folding = Z_LVAL_PP(val);
+1631                         break;
+1632                 case PHP_XML_OPTION_SKIP_TAGSTART:
+1633                         convert_to_long_ex(val);
+1634                         parser->toffset = Z_LVAL_PP(val);
+1635                         break;
+
+(gdb) p/x parser->toffset
+$3 = 0xfffffffc
+
+The toffset attribute is used in a number of locations. In gdbsession.txt we
+can see it being used in the following code (line 787) to calculate the
+address of the string to pass to the start-element handler. By adding -4 we
+skip backwards into memory located before the string.
+
+File : ext/xml/xml.c
+
+771 void _xml_startElementHandler(void *userData, const XML_Char *name, const XML_Char **attributes)
+772 {
+773         xml_parser *parser = (xml_parser *)userData;
+774         const char **attrs = (const char **) attributes;
+775         char *tag_name;
+776         char *att, *val;
+777         int val_len;
+778         zval *retval, *args[3];
+779
+780         if (parser) {
+781                 parser->level++;
+782
+783                 tag_name = _xml_decode_tag(parser, name);
+784
+785                 if (parser->startElementHandler) {
+786                         args[0] = _xml_resource_zval(parser->index);
+787                         args[1] = _xml_string_zval(((char *) tag_name) + parser->toffset);
+788                         MAKE_STD_ZVAL(args[2]);
+789                         array_init(args[2]);
+790
+791                         while (attributes && *attributes) {
+792                                 att = _xml_decode_tag(parser, attributes[0]);
+793                                 val = xml_utf8_decode(attributes[1], strlen(attributes[1]), &val_len, parser->target_encoding);
+794
+795                                 add_assoc_stringl(args[2], att, val, val_len, 0);
+796
+797                                 attributes += 2;
+798
+799                                 efree(att);
+800                         }
+801
+802                         if ((retval = xml_call_handler(parser, parser->startElementHandler, parser->startElementPtr, 3, args))) {
+803                                 zval_ptr_dtor(&retval);
+804                         }
+805                 }
+
+Breakpoint 3, _xml_startElementHandler (userData=0xb7bdb12c, name=0x8a6b510 "FOO:BAR", attributes=0x0) at ext/xml/xml.c:787
+787                             args[1] = _xml_string_zval(((char *) tag_name) + parser->toffset);
+(gdb) x/s tag_name
+0xb7bdc0e0:      "FOO:BAR"
+(gdb) p/x parser->toffset
+$4 = 0xfffffffc
+(gdb) s
+_xml_string_zval (str=0xb7bdc0dc "\b\001") at ext/xml/xml.c:394
+394             int len = strlen(str);
+(gdb) x/16x str
+0xb7bdc0dc:     0x08    0x01    0x00    0x00    0x46    0x4f    0x4f    0x3a
+0xb7bdc0e4:     0x42    0x41    0x52    0x00    0x25    0x00    0x00    0x00
+(gdb) p/x len
+$5 = 0x2
+
+As shown, the string to be passed to the element handler is now considered
+to be (0x08 0x01) rather than (0x46 0x4f ...) [FOO:BAR].
+
+The element handler then prints these byte values.
+

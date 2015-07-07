@@ -1,0 +1,57 @@
+From d6e911fa90a8cb711a9a94e6a3ae790bfe891b13 Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean@persistencelabs.com>
+Date: Sun, 15 Dec 2013 23:14:51 +0000
+Subject: [PATCH 1/1] Check that tag + tag offset is still actually within the
+ tag string
+
+---
+ ext/xml/xml.c |   20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+diff --git a/ext/xml/xml.c b/ext/xml/xml.c
+index 1ef01c8..c2c97d0 100644
+--- a/ext/xml/xml.c
++++ b/ext/xml/xml.c
+@@ -781,6 +781,13 @@ void _xml_startElementHandler(void *userData, const XML_Char *name, const XML_Ch
+ 		parser->level++;
+ 
+ 		tag_name = _xml_decode_tag(parser, name);
++		unsigned tag_len = strlen(tag_name);
++		if (parser->toffset > tag_len) {
++			TSRMLS_FETCH();
++			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Tag offset > tag length");
++			return;
++		}
++
+ 
+ 		if (parser->startElementHandler) {
+ 			args[0] = _xml_resource_zval(parser->index);
+@@ -866,6 +873,12 @@ void _xml_endElementHandler(void *userData, const XML_Char *name)
+ 		zval *retval, *args[2];
+ 
+ 		tag_name = _xml_decode_tag(parser, name);
++		unsigned tag_len = strlen(tag_name);
++		if (parser->toffset > tag_len) {
++			TSRMLS_FETCH();
++			php_error_docref(NULL TSRMLS_CC, E_WARNING, "Tag offset > tag length");
++			return;
++		}
+ 
+ 		if (parser->endElementHandler) {
+ 			args[0] = _xml_resource_zval(parser->index);
+@@ -989,6 +1002,13 @@ void _xml_characterDataHandler(void *userData, const XML_Char *s, int len)
+ 
+ 						array_init(tag);
+ 
++						unsigned tag_len = strlen(parser->ltags[parser->level-1]);
++						if (parser->toffset > tag_len) {
++							TSRMLS_FETCH();
++							php_error_docref(NULL TSRMLS_CC, E_WARNING, "Tag offset > tag length");
++							return;
++						}
++
+ 						_xml_add_to_info(parser,parser->ltags[parser->level-1] + parser->toffset);
+ 
+ 						add_assoc_string(tag,"tag",parser->ltags[parser->level-1] + parser->toffset,1);
+-- 
+1.7.9.5

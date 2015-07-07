@@ -1,0 +1,38 @@
+From 774f9b53e3ed24446dde405e55aa016dd73ab515 Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean@persistencelabs.com>
+Date: Sun, 29 Dec 2013 02:25:45 +0000
+Subject: [PATCH] Do not clean the zend pointer stacks for the user exception
+ handlers and user error handlers until we know all other
+ references have been released.
+
+zend_ptr_stack_clean is not reference count aware and will simply deallocate
+the memory pointed to by each item on the stack. This can potentially lead to
+use-after-free conditions if a reference to the same object is held elsewhere.
+---
+ Zend/zend_execute_API.c |    4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/Zend/zend_execute_API.c b/Zend/zend_execute_API.c
+index 779e6d8..6ed01dd 100644
+--- a/Zend/zend_execute_API.c
++++ b/Zend/zend_execute_API.c
+@@ -265,8 +265,6 @@ void shutdown_executor(TSRMLS_D) /* {{{ */
+ 
+ 		zend_stack_destroy(&EG(user_error_handlers_error_reporting));
+ 		zend_stack_init(&EG(user_error_handlers_error_reporting));
+-		zend_ptr_stack_clean(&EG(user_error_handlers), ZVAL_DESTRUCTOR, 1);
+-		zend_ptr_stack_clean(&EG(user_exception_handlers), ZVAL_DESTRUCTOR, 1);
+ 	} zend_end_try();
+ 
+ 	zend_try {
+@@ -322,6 +320,8 @@ void shutdown_executor(TSRMLS_D) /* {{{ */
+ 		zend_hash_destroy(&EG(included_files));
+ 
+ 		zend_stack_destroy(&EG(user_error_handlers_error_reporting));
++		zend_ptr_stack_clean(&EG(user_error_handlers), ZVAL_DESTRUCTOR, 1);
++		zend_ptr_stack_clean(&EG(user_exception_handlers), ZVAL_DESTRUCTOR, 1);
+ 		zend_ptr_stack_destroy(&EG(user_error_handlers));
+ 		zend_ptr_stack_destroy(&EG(user_exception_handlers));
+ 		zend_objects_store_destroy(&EG(objects_store));
+-- 
+1.7.9.5

@@ -1,0 +1,188 @@
+Description:
+------------
+Summary
+-------
+
+DOM objects contain a reference to the document they are associated with. When
+releasing this reference, the php_libxml_decrement_doc_ref function does not
+set the object->document field to NULL after decrementing
+object->document->refcount. Once the reference count reaches 0 the associated
+XML document (object->document->ptr) is passed to xmlFreeDoc, while the
+document properties object (object->document->doc_props) and the document
+itself (object->document) are passed to efree. This results in a number of
+dangling pointers to freed memory in objects that are associated with the same
+document.
+
+Reported: 2014-01-16. URL: https://bugs.php.net/bug.php?id=66502
+
+Impact
+------
+
+This primitive can be (ab)used in a number of ways to trigger double-free and
+use-after-free scenarios, likely leading to arbitrary code execution.
+
+Patch Details
+-------------
+
+The patch updates php_libxml_decrement_doc_ref so that it sets object->document
+to NULL once the object releases its reference to the document. Previously,this
+was only done if releasing the reference decremented the reference count to 0.
+
+Bug Details
+-----------
+
+The php_libxml_decrement_doc_ref function can be repeatedly triggered via the
+__construct method of DOM comment. The trigger file uses repeated calls to
+this function in order to demonstrate the bug.
+
+We begin by setting a breakpoint on zif_dom_node_append_child in order
+to figure out which dom_object is associated with the root node. We will
+later use this to show the dangling pointer.
+
+Breakpoint 5, zif_dom_node_append_child (ht=1, return_value=0xb7fc5ddc, return_value_ptr=0xb7fa7244, this_ptr=0xb7fc43a8,
+    return_value_used=1) at ext/dom/node.c:1318
+1318            stricterror = dom_get_strict_error(intern->document);
+(gdb) bt
+#0  zif_dom_node_append_child (ht=1, return_value=0xb7fc5ddc, return_value_ptr=0xb7fa7244, this_ptr=0xb7fc43a8, return_value_used=1)
+    at ext/dom/node.c:1318
+#1  0x085ee6fa in zend_do_fcall_common_helper_SPEC (execute_data=0xb7fa72d0) at Zend/zend_vm_execute.h:554
+#2  0x085a713f in ZEND_DO_FCALL_BY_NAME_SPEC_HANDLER (execute_data=0xb7fa72d0) at Zend/zend_vm_execute.h:689
+#3  0x08590953 in execute_ex (execute_data=0xb7fa72d0) at Zend/zend_vm_execute.h:363
+#4  0x08590a1d in zend_execute (op_array=0xb7fc4c34) at Zend/zend_vm_execute.h:388
+#5  0x08547b70 in zend_execute_scripts (type=8, retval=0x0, file_count=3) at Zend/zend.c:1334
+#6  0x0849a3ca in php_execute_script (primary_file=0xbfffebe0) at main/main.c:2490
+#7  0x0861e986 in do_cli (argc=2, argv=0x89f82b8) at sapi/cli/php_cli.c:994
+#8  0x0861d87a in main (argc=2, argv=0x89f82b8) at sapi/cli/php_cli.c:1378
+
+(gdb) p/x intern
+$47 = 0xb7fc5a58
+(gdb) p *intern
+$48 = {std = {ce = 0x8a3ced8, properties = 0x0, properties_table = 0x0, guards = 0x0}, ptr = 0xb7fc59e4, document = 0xb7fc5a20,
+  prop_handler = 0x8a40540, handle = 1}
+
+As can be seen above, the dom_object is at 0xb7fc5a58 and references the
+document object at 0xb7fc5a20.
+
+Next we set a breakpoint on php_libxml_decrement_doc_ref and continue. This
+breakpoint is first hit with the following backtrace:
+
+(gdb) bt
+#0  php_libxml_decrement_doc_ref (object=0xb7fc5b40) at ext/libxml/libxml.c:1238
+#1  0x080f884f in php_libxml_clear_object (object=0xb7fc5b40) at ext/libxml/libxml.c:160
+#2  0x080f8572 in php_libxml_unregister_node (nodep=0x8ad0098) at ext/libxml/libxml.c:172
+#3  0x080f83ec in php_libxml_node_free_resource (node=0x8ad0098) at ext/libxml/libxml.c:1292
+#4  0x082549f8 in zim_domcomment___construct (ht=1, return_value=0xb7fc5b8c, return_value_ptr=0xb7fa71a4, this_ptr=0xb7fc5ddc,
+    return_value_used=0) at ext/dom/comment.c:78
+#5  0x085ee6fa in zend_do_fcall_common_helper_SPEC (execute_data=0xb7fa72d0) at Zend/zend_vm_execute.h:554
+#6  0x085a713f in ZEND_DO_FCALL_BY_NAME_SPEC_HANDLER (execute_data=0xb7fa72d0) at Zend/zend_vm_execute.h:689
+#7  0x08590953 in execute_ex (execute_data=0xb7fa72d0) at Zend/zend_vm_execute.h:363
+#8  0x08590a1d in zend_execute (op_array=0xb7fc4c34) at Zend/zend_vm_execute.h:388
+#9  0x08547b70 in zend_execute_scripts (type=8, retval=0x0, file_count=3) at Zend/zend.c:1334
+#10 0x0849a3ca in php_execute_script (primary_file=0xbfffebe0) at main/main.c:2490
+#11 0x0861e986 in do_cli (argc=2, argv=0x89f82b8) at sapi/cli/php_cli.c:994
+#12 0x0861d87a in main (argc=2, argv=0x89f82b8) at sapi/cli/php_cli.c:1378
+
+When __construct is called on a comment already associated with an xmlNodePtr
+it uses php_libxml_node_free_resource to release its reference to this
+object. Line 78 below.
+
+File : ext/dom/comment.c
+
+50 PHP_METHOD(domcomment, __construct)
+51 {
+52
+53         zval *id;
+54         xmlNodePtr nodep = NULL, oldnode = NULL;
+55         dom_object *intern;
+56         char *value = NULL;
+57         int value_len;
+58         zend_error_handling error_handling;
+59
+
+...
+
+73
+74         intern = (dom_object *)zend_object_store_get_object(id TSRMLS_CC);
+75         if (intern != NULL) {
+76                 oldnode = dom_object_get_node(intern);
+77                 if (oldnode != NULL) {
+78                         php_libxml_node_free_resource(oldnode  TSRMLS_CC);
+79                 }
+80                 php_libxml_increment_node_ptr((php_libxml_node_object *)intern, (xmlNodePtr)nodep, (void *)intern TSRMLS_CC);
+81         }
+82 }
+
+The document referenced by the comment node is the same as that referenced by
+the root node and the reference count is currently 3.
+
+(gdb) p/x object->document
+$1 = 0xb7fc5a20
+(gdb) p/x object->document->refcount
+$2 = 0x3
+
+This breakpoint will be hit a further two times in succession:
+
+Breakpoint 1, php_libxml_decrement_doc_ref (object=0xb7fc5b40) at ext/libxml/libxml.c:1238
+1238            int ret_refcount = -1;
+(gdb) p/x object->document->refcount
+$3 = 0x2
+(gdb) c
+Continuing.
+
+Breakpoint 1, php_libxml_decrement_doc_ref (object=0xb7fc5b40) at ext/libxml/libxml.c:1238
+1238            int ret_refcount = -1;
+(gdb) p/x object->document->refcount
+$4 = 0x1
+
+On this final break the refcount is 1. It is decremented on line 1241 and on
+line 1244 the document pointer is passed to xmlFreeDoc. The object->document
+itself is then passed to efree on line 1253. Finally, object->document is set
+to NULL, thus preventing any use of the document pointer via the comment object.
+The call to xmlFreeDoc also results in the freeing of any xmlNodePtr objects
+that have been appended to the document.
+
+File : ext/libxml/libxml.c
+
+1236 PHP_LIBXML_API int php_libxml_decrement_doc_ref(php_libxml_node_object *object TSRMLS_DC)
+1237 {
+1238         int ret_refcount = -1;
+1239
+1240         if (object != NULL && object->document != NULL) {
+1241                 ret_refcount = --object->document->refcount;
+1242                 if (ret_refcount == 0) {
+1243                         if (object->document->ptr != NULL) {
+1244                                 xmlFreeDoc((xmlDoc *) object->document->ptr);
+1245                         }
+1246                         if (object->document->doc_props != NULL) {
+1247                                 if (object->document->doc_props->classmap) {
+1248                                         zend_hash_destroy(object->document->doc_props->classmap);
+1249                                         FREE_HASHTABLE(object->document->doc_props->classmap);
+1250                                 }
+1251                                 efree(object->document->doc_props);
+1252                         }
+1253                         efree(object->document);
+1254                         object->document = NULL;
+1255                 }
+1256         }
+1257
+1258         return ret_refcount;
+
+A number of dangling pointers are in play at this point. e.g The
+object->document, object->document->doc_props, object->document->ptr, and
+xmlNodePtr instances referenced by the 'root' element are now all freed.
+
+(gdb) p/x object->document
+$5 = 0xb7fc5a20
+(gdb) n
+1253                            efree(object->document);
+(gdb) n
+1254                            object->document = NULL;
+(gdb) p/x object->document
+$6 = 0x0
+(gdb) p/x *((dom_object*)0xb7fc5a58)
+$7 = {std = {ce = 0x8a3ced8, properties = 0x0, properties_table = 0x0, guards = 0x0}, ptr = 0xb7fc59e4, document = 0xb7fc5a20,
+  prop_handler = 0x8a40540, handle = 0x1}
+
+In the above we can see that the comment dom_object for the comment object
+has been cleared but the dom_object associated with the root object still
+references the freed memory.

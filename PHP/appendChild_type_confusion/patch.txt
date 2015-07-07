@@ -1,0 +1,28 @@
+From 647a0d12f802671f4c881ea9169ef1efa34e2343 Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean@persistencelabs.com>
+Date: Thu, 2 Jan 2014 21:15:52 +0000
+Subject: [PATCH 1/1] Ensure that an XML_DOCUMENT_NODE cannot be added as a
+ child.
+
+---
+ ext/dom/node.c |    5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/ext/dom/node.c b/ext/dom/node.c
+index 3279567..b3ea555 100644
+--- a/ext/dom/node.c
++++ b/ext/dom/node.c
+@@ -1323,6 +1323,11 @@ PHP_FUNCTION(dom_node_append_child)
+ 		RETURN_FALSE;
+ 	}
+ 
++	if (child->type == XML_DOCUMENT_NODE) {
++		php_error_docref(NULL TSRMLS_CC, E_WARNING, "Cannot append document as child node");
++		RETURN_FALSE;
++	}
++
+ 	if (dom_hierarchy(nodep, child) == FAILURE) {
+ 		php_dom_throw_error(HIERARCHY_REQUEST_ERR, stricterror TSRMLS_CC);
+ 		RETURN_FALSE;
+-- 
+1.7.9.5

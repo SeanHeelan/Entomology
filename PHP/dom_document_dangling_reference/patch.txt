@@ -1,0 +1,26 @@
+From b47a888933f0dd98dd6bdfd937b9cd69a7f25635 Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean@persistencelabs.com>
+Date: Thu, 19 Dec 2013 16:24:35 +0000
+Subject: [PATCH] Set the document attribute to NULL when the object releases
+ its reference
+
+---
+ ext/libxml/libxml.c |    2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ext/libxml/libxml.c b/ext/libxml/libxml.c
+index 05b8df4..6249873 100644
+--- a/ext/libxml/libxml.c
++++ b/ext/libxml/libxml.c
+@@ -1251,8 +1251,8 @@ PHP_LIBXML_API int php_libxml_decrement_doc_ref(php_libxml_node_object *object T
+ 				efree(object->document->doc_props);
+ 			}
+ 			efree(object->document);
+-			object->document = NULL;
+ 		}
++		object->document = NULL;
+ 	}
+ 
+ 	return ret_refcount;
+-- 
+1.7.9.5

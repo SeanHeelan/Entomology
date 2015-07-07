@@ -1,0 +1,77 @@
+(gdb) r trigger.php 
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+
+Starting program: /home/user/php/sapi/cli/php /home/user/trigger.php
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/i386-linux-gnu/libthread_db.so.1".
+
+Breakpoint 1, zif_xml_parser_set_option (ht=3, return_value=0xb7bdb21c, return_value_ptr=0xb7bbf10c, this_ptr=0x0, return_value_used=0) at ext/xml/xml.c:1622
+1622            if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "rlZ", &pind, &opt, &val) == FAILURE) {
+(gdb) n
+1625            ZEND_FETCH_RESOURCE(parser,xml_parser *, &pind, -1, "XML Parser", le_xml_parser);
+(gdb) 
+1627            switch (opt) {
+(gdb) 
+1633                            convert_to_long_ex(val);
+(gdb) 
+1634                            parser->toffset = Z_LVAL_PP(val);
+(gdb) 
+1635                            break;
+(gdb) p/x parser->toffset
+$3 = 0xfffffffc
+(gdb) c
+Continuing.
+
+Breakpoint 2, _xml_startElementHandler (userData=0xb7bdb12c, name=0x8a6b510 "FOO:BAR", attributes=0x0) at ext/xml/xml.c:773
+773             xml_parser *parser = (xml_parser *)userData;
+(gdb) l
+768     /* }}} */
+769
+770     /* {{{ _xml_startElementHandler() */
+771     void _xml_startElementHandler(void *userData, const XML_Char *name, const XML_Char **attributes)
+772     {
+773             xml_parser *parser = (xml_parser *)userData;
+774             const char **attrs = (const char **) attributes;
+775             char *tag_name;
+776             char *att, *val;
+777             int val_len;
+(gdb) 
+778             zval *retval, *args[3];
+779
+780             if (parser) {
+781                     parser->level++;
+782
+783                     tag_name = _xml_decode_tag(parser, name);
+784
+785                     if (parser->startElementHandler) {
+786                             args[0] = _xml_resource_zval(parser->index);
+787                             args[1] = _xml_string_zval(((char *) tag_name) + parser->toffset);
+(gdb) c
+Continuing.
+
+Breakpoint 3, _xml_startElementHandler (userData=0xb7bdb12c, name=0x8a6b510 "FOO:BAR", attributes=0x0) at ext/xml/xml.c:787
+787                             args[1] = _xml_string_zval(((char *) tag_name) + parser->toffset);
+(gdb) x/s tag_name
+0xb7bdc0e0:      "FOO:BAR"
+(gdb) p/x parser->toffset
+$4 = 0xfffffffc
+(gdb) s
+_xml_string_zval (str=0xb7bdc0dc "\b\001") at ext/xml/xml.c:394
+394             int len = strlen(str);
+(gdb) x/16x str
+0xb7bdc0dc:     0x08    0x01    0x00    0x00    0x46    0x4f    0x4f    0x3a
+0xb7bdc0e4:     0x42    0x41    0x52    0x00    0x25    0x00    0x00    0x00
+(gdb) n
+395             MAKE_STD_ZVAL(ret);
+(gdb) p/x len
+$5 = 0x2
+(gdb) c
+Continuing.
+ 
+ 
+
+0801
+0801
+[Inferior 1 (process 13133) exited normally]
+(gdb)

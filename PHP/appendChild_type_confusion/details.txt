@@ -1,0 +1,354 @@
+Description:
+------------
+Summary
+-------
+
+It is possible to append a DOMDocument object as the child of a DOM element,
+resulting in the xmlDoc representing the document being treated as a regular
+xmlNode.  By destroying the DOM element, and thus its children, the xmlDoc will
+be freed without taking into account the fact that it may be referenced by
+other DOM elements.
+
+The outcome is that the xmlDoc is deallocated and a number of dangling pointers
+to it may remain e.g. the document->ptr field of any dom_object instances that
+have been created via the createElement method of the DOMDocument, prior to
+triggering its destruction. The dangling pointers can be abused as in standard
+use-after-free scenarios.
+
+Reported 2014-01-22. URL: https://bugs.php.net/bug.php?id=66551
+
+Impact
+------
+
+This bug results in one or more dangling pointers that can be leveraged to
+create use-after-free and double free scenarios. Arbitrary code execution is
+likely.
+
+Patch Details
+-------------
+
+The attached patch checks the node passed to appendChild to ensure that its
+type field is not XML_DOCUMENT_NODE. If it is then the function prints an error
+and returns.
+
+Bug Details
+-----------
+
+The trigger below demonstrates the issue. It is straightforward to add
+a document as a child to another DOM element.
+
+$doc1 = new DOMDocument('1.0', 'UTF-8');
+$a = $doc1->createElement('el_a');
+$a->appendChild($doc1);
+
+1. The document is created
+
+(gdb) r /home/user/php/writeup/trigger_double_free.php
+
+Breakpoint 10, zim_domdocument___construct (ht=2, return_value=0xb7c4a198, return_value_ptr=0xb7c2e1a0, this_ptr=0xb7c4909c, return_value_used=0)
+    at /home/user/php/ext/dom/document.c:1455
+
+...
+
+1468            docp = xmlNewDoc(version);
+(gdb) n
+1470            if (!docp) {
+(gdb) p/x docp
+$68 = 0x89603b8
+
+2. The xmlNode element is created
+
+Breakpoint 16, zif_dom_document_create_element (ht=1, return_value=0xb7c49064, return_value_ptr=0xb7c2e170, this_ptr=0xb7c4909c, return_value_used=1)
+    at /home/user/php/ext/dom/document.c:909
+
+...
+
+922             node = xmlNewDocNode(docp, NULL, name, value);
+(gdb)
+923             if (!node) {
+(gdb) p/x node
+$69 = 0x8960440
+
+3. The new element is linked to the same document as the DOMDocument
+dom_object. After we trigger the deallocation of the xmlDoc we will be able to
+access a dangling pointer to it via this field on any dom_object that was
+created and linked to the DOMDocument.
+
+Breakpoint 21, php_dom_create_object (obj=0x8960440, found=0xbfffb5a4, return_value=0xb7c49064, domobj=0xb7c4a170)
+    at /home/user/php/ext/dom/php_dom.c:1430
+1430                            intern->document = domobj->document;
+(gdb) p/x domobj->document->ptr
+$81 = 0x89603b8
+
+4. The xmlDoc is appended to the list of children of the xmlNode
+
+Breakpoint 11, zif_dom_node_append_child (ht=1, return_value=0xb7c49080, return_value_ptr=0xb7c2e140, this_ptr=0xb7c49064, return_value_used=0)
+    at /home/user/php/ext/dom/node.c:1302
+
+...
+
+1310            DOM_GET_OBJ(nodep, id, xmlNodePtr, intern);
+
+...
+
+1316            DOM_GET_OBJ(child, node, xmlNodePtr, childobj);
+(gdb) n
+1318            stricterror = dom_get_strict_error(intern->document);
+(gdb) p/x nodep
+$70 = 0x8960440
+(gdb) p/x child
+$71 = 0x89603b8
+
+Breakpoint 17, zif_dom_node_append_child (ht=1, return_value=0xb7c49080, return_value_ptr=0xb7c2e140, this_ptr=0xb7c49064, return_value_used=0)
+    at /home/user/php/ext/dom/node.c:1383
+1383                    new_child = xmlAddChild(nodep, child);
+(gdb) p/x nodep
+$72 = 0x8960440
+(gdb) p/x child
+$73 = 0x89603b8
+
+After xmlAddChild returns, the xmlNode representing the element (0x8960440)
+points to the xmlDoc (0x89603b8) via its children field.
+
+(gdb) p/x ((xmlNode*)0x8960440)->children
+$76 = 0x89603b8
+
+It is now worth looking at the definitions of xmlNode and xmlDoc. They share a
+number of common fields at the start of their definitions and this allows for
+one to be treated as an instance of the other for many operations.
+
+File : libxml2-2.7.8/include/libxml/tree.h
+
+450 struct _xmlNode {
+451     void           *_private;   /* application data */
+452     xmlElementType   type;      /* type number, must be second ! */
+453     const xmlChar   *name;      /* the name of the node, or the entity */
+454     struct _xmlNode *children;  /* parent->childs link */
+455     struct _xmlNode *last;      /* last child link */
+456     struct _xmlNode *parent;    /* child->parent link */
+457     struct _xmlNode *next;      /* next sibling link  */
+458     struct _xmlNode *prev;      /* previous sibling link  */
+459     struct _xmlDoc  *doc;       /* the containing document */
+460
+461     /* End of common part */
+462     xmlNs           *ns;        /* pointer to the associated namespace */
+463     xmlChar         *content;   /* the content */
+464     struct _xmlAttr *properties;/* properties list */
+465     xmlNs           *nsDef;     /* namespace definitions on this node */
+466     void            *psvi;      /* for type/PSVI informations */
+467     unsigned short   line;      /* line number */
+468     unsigned short   extra;     /* extra data for XPath/XSLT */
+469 };
+
+
+File : libxml2-2.7.8/include/libxml/tree.h
+
+512 struct _xmlDoc {
+513     void           *_private;   /* application data */
+514     xmlElementType  type;       /* XML_DOCUMENT_NODE, must be second ! */
+515     char           *name;       /* name/filename/URI of the document */
+516     struct _xmlNode *children;  /* the document tree */
+517     struct _xmlNode *last;      /* last child link */
+518     struct _xmlNode *parent;    /* child->parent link */
+519     struct _xmlNode *next;      /* next sibling link  */
+520     struct _xmlNode *prev;      /* previous sibling link  */
+521     struct _xmlDoc  *doc;       /* autoreference to itself */
+522
+523     /* End of common part */
+524     int             compression;/* level of zlib compression */
+525     int             standalone; /* standalone document (no external refs)
+526                                      1 if standalone="yes"
+527                                      0 if standalone="no"
+528                                     -1 if there is no XML declaration
+529                                     -2 if there is an XML declaration, but no
+530                                         standalone attribute was specified */
+531     struct _xmlDtd  *intSubset; /* the document internal subset */
+532     struct _xmlDtd  *extSubset; /* the document external subset */
+533     struct _xmlNs   *oldNs;     /* Global namespace, the old way */
+534     const xmlChar  *version;    /* the XML version string */
+535     const xmlChar  *encoding;   /* external initial encoding, if any */
+536     void           *ids;        /* Hash table for ID attributes if any */
+537     void           *refs;       /* Hash table for IDREFs attributes if any */
+538     const xmlChar  *URL;        /* The URI for that document */
+539     int             charset;    /* encoding of the in-memory content
+540                                    actually an xmlCharEncoding */
+541     struct _xmlDict *dict;      /* dict used to allocate names or NULL */
+542     void           *psvi;       /* for type/PSVI informations */
+543     int             parseFlags; /* set of xmlParserOption used to parse the
+544                                    document */
+545     int             properties; /* set of xmlDocProperties for this document
+546                                    set at the end of parsing */
+547 };
+
+The type field allows one to easily determine what object type they are
+processing.  Most processing functions check this type and only perform their
+action for nodes of the correct type. So, while we can treat the xmlDoc as an
+xmlNode, by accessing it through the children of the xmlNode representing the
+element el_a, the majority of functions do not then access the fields beyond the
+common ones shared by both types as the type field is still XML_DOCUMENT_NODE
+(9), not one of the ones they are designed to process e.g. XML_ELEMENT_NODE (1).
+
+Problems arise however when the xmlNode representing the element is destroyed.
+This can be triggered by removing all references to the PHP variable. Before
+doing this, we first create a second element.
+
+$b = $doc1->createElement('el_b');
+
+This will result in the creation of another dom_object that will reference the
+xmlDoc via the document->ptr field. This can be used as a dangling pointer
+later, but more importantly it will also increment the reference count on the
+xmlDoc.  This is necessary to avoid a crash during the destruction of el_a,
+when dealing with system allocators that attempt to detect double-frees.
+
+If the second element is not created then the reference count on the xmlDoc
+will be 1 i.e. the reference from el_a. When we trigger the destruction of el_a
+it will first deallocate its children i.e. the xmlDoc. We will explain why this
+occurs later. The destruction of el_a will then proceed. As part of this
+process the reference count on its associated document will be decremented to 0
+and then an attempt to free this document will occur.  As the document has
+already been freed this will result in a double-free error check being
+triggered without any opportunity for the attacker to intervene between the two
+frees and prevent this outcome.
+
+With the above reference created, the destruction of the xmlNode representing
+el_a is triggered via $a = 0.  When this occurs, the xmlNode representing el_a
+will be destroyed via php_libxml_node_free_resource.
+
+Breakpoint 18, php_libxml_node_free_resource (node=0x8960440) at /home/user/php/ext/libxml/libxml.c:1263
+1263            if (!node) {
+(gdb) bt 7
+#0  php_libxml_node_free_resource (node=0x8960440) at /home/user/php/ext/libxml/libxml.c:1263
+#1  0x080b0704 in php_libxml_node_decrement_resource (object=0xb7c4a4e4) at /home/user/php/ext/libxml/libxml.c:1308
+#2  0x08172783 in dom_objects_free_storage (object=0xb7c4a4e4) at /home/user/php/ext/dom/php_dom.c:1102
+#3  0x083a131a in zend_objects_store_del_ref_by_handle_ex (handle=2, handlers=0x8883760) at /home/user/php/Zend/zend_objects_API.c:226
+#4  0x083a111a in zend_objects_store_del_ref (zobject=0xbfffb684) at /home/user/php/Zend/zend_objects_API.c:178
+#5  0x08370418 in _zval_dtor_func (zvalue=0xbfffb684) at /home/user/php/Zend/zend_variables.c:54
+#6  0x083a441d in zend_assign_const_to_variable (variable_ptr_ptr=0xb7c4a518, value=0xb7c4a8f4) at /home/user/php/Zend/zend_execute.c:883
+
+Prior to freeing the xmlNode this will free all of its children. We can see
+that the function does check if the node itself has the type XML_DOCUMENT_NODE,
+but this check is not extended to its children prior to calling
+php_libxml_node_free_list.
+
+File : ext/libxml/libxml.c
+
+1261 PHP_LIBXML_API void php_libxml_node_free_resource(xmlNodePtr node TSRMLS_DC)
+1262 {
+1263         if (!node) {
+1264                 return;
+1265         }
+1266
+1267         switch (node->type) {
+1268                 case XML_DOCUMENT_NODE:
+1269                 case XML_HTML_DOCUMENT_NODE:
+1270                         break;
+1271                 default:
+1272                         if (node->parent == NULL || node->type == XML_NAMESPACE_DECL) {
+1273                                 php_libxml_node_free_list((xmlNodePtr) node->children TSRMLS_CC);
+
+As discussed earlier, node->children for the xmlNode representing el_a points
+to the xmlDoc. The call to php_libxml_node_free_list routes through to
+php_libxml_node_free, which uses xmlFreeNode to perform the actual
+deallocation.
+
+File : ext/libxml/libxml.c
+
+223 static void php_libxml_node_free_list(xmlNodePtr node TSRMLS_DC)
+224 {
+225         xmlNodePtr curnode;
+226
+227         if (node != NULL) {
+228                 curnode = node;
+229                 while (curnode != NULL) {
+
+...
+
+260                         php_libxml_node_free(node);
+261                 }
+262         }
+263 }
+
+File : ext/libxml/libxml.c
+
+184 static void php_libxml_node_free(xmlNodePtr node)
+185 {
+186         if(node) {
+187                 if (node->_private != NULL) {
+188                         ((php_libxml_node_ptr *) node->_private)->node = NULL;
+189                 }
+190                 switch (node->type) {
+
+...
+
+217                         default:
+218                                 xmlFreeNode(node);
+219                 }
+220         }
+221 }
+
+File : libxml2-2.7.8/include/libxml/tree.h
+
+3665 void
+3666 xmlFreeNode(xmlNodePtr cur) {
+
+...
+
+3703     if ((cur->type != XML_ELEMENT_NODE) &&
+3704         (cur->content != NULL) &&
+3705         (cur->type != XML_ENTITY_REF_NODE) &&
+3706         (cur->type != XML_XINCLUDE_END) &&
+3707         (cur->type != XML_XINCLUDE_START) &&
+3708         (cur->content != (xmlChar *) &(cur->properties))) {
+3709         DICT_FREE(cur->content)
+3710     }
+
+...
+
+3727     xmlFree(cur);
+3728 }
+
+xmlNodeFree assumes it is dealing with an xmlNode and as well as freeing the
+node itself (line 3727), attempts to free a number of pointers that are
+contained outside the common fields that are shared with the xmlDoc structure.
+One such field that may be problematic is the xmlNode->content field, freed on
+line 3709. On a 32-bit architecture this field overlaps with the standalone
+field of a xmlDoc object. The defaut value for the standalone field is -1, thus
+when cur->content is passed to free a segmentation fault occurs as it receives
+the pointer 0xffffffff.
+
+Fortunately, the standalone field of an xmlDoc can be easily modified. It can
+take any value from the set [-1, 0, 1]. Thus, before destroying el_a the
+trigger file contains the line $doc1->standalone = 0. When cur->content is
+freed it will now produce a free(0) call , effectively a NOP when dealing with
+libc.
+
+Once the free on line 3727 has completed the dom_object associated with el_b
+references deallocated memory via its document->ptr field. This may be abused
+in a number of ways, but the easiest way to see the effect is simply to let the
+trigger script run until completion. When el_b is destroyed it holds the last
+remaining reference to the document. Thus the document will be freed via
+xmlFreeDoc. This routes through to the libc free function which detects the
+double free as we have previously deallocated the document when we destroyed
+el_a.
+
+Program received signal SIGABRT, Aborted.
+0xb7fdd424 in __kernel_vsyscall ()
+(gdb) bt 18
+#0  0xb7fdd424 in __kernel_vsyscall ()
+#1  0xb7cb31df in __GI_raise (sig=6) at ../nptl/sysdeps/unix/sysv/linux/raise.c:64
+#2  0xb7cb6825 in __GI_abort () at abort.c:91
+#3  0xb7cf039a in __libc_message (do_abort=2, fmt=0xb7deb888 "*** glibc detected *** %s: %s: 0x%s ***\n") at ../sysdeps/unix/sysv/linux/libc_fatal.c:201
+#4  0xb7cfaee2 in malloc_printerr (action=<optimised out>, str=<optimised out>, ptr=0x89603b8) at malloc.c:5039
+#5  0xb7e72c41 in xmlFreeDoc__internal_alias (cur=0x89603b8) at ../../tree.c:1242
+#6  0x080b0586 in php_libxml_decrement_doc_ref (object=0xb7c4a538) at /home/user/php/ext/libxml/libxml.c:1244
+#7  0x080b073c in php_libxml_node_decrement_resource (object=0xb7c4a538) at /home/user/php/ext/libxml/libxml.c:1317
+#8  0x08172783 in dom_objects_free_storage (object=0xb7c4a538) at /home/user/php/ext/dom/php_dom.c:1102
+#9  0x083a131a in zend_objects_store_del_ref_by_handle_ex (handle=3, handlers=0x8883760) at /home/user/php/Zend/zend_objects_API.c:226
+#10 0x083a111a in zend_objects_store_del_ref (zobject=0xb7c4a198) at /home/user/php/Zend/zend_objects_API.c:178
+#11 0x08370418 in _zval_dtor_func (zvalue=0xb7c4a198) at /home/user/php/Zend/zend_variables.c:54
+#12 0x08360fa6 in _zval_dtor (zvalue=0xb7c4a198) at /home/user/php/Zend/zend_variables.h:35
+#13 i_zval_ptr_dtor (zval_ptr=0xb7c4a198) at /home/user/php/Zend/zend_execute.h:79
+#14 _zval_ptr_dtor (zval_ptr=0xb7c4a580) at /home/user/php/Zend/zend_execute_API.c:427
+#15 0x083800d9 in zend_hash_apply_deleter (ht=0x888653c, p=0xb7c4a574) at /home/user/php/Zend/zend_hash.c:626
+#16 0x083804ee in zend_hash_reverse_apply (ht=0x888653c, apply_func=0x8360983 <zval_call_destructor>) at /home/user/php/Zend/zend_hash.c:780
+#17 0x08360a08 in shutdown_destructors () at /home/user/php/Zend/zend_execute_API.c:217
