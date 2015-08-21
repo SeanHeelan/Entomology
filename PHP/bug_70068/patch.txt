@@ -1,0 +1,50 @@
+From ca82ac62f74105bc55540fb6fe8e5c15d57aa718 Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean.heelan@gmail.com>
+Date: Tue, 7 Jul 2015 16:53:53 +0100
+Subject: [PATCH] Ensure that the pflags zval is not destroyed before var_hash,
+ as otherwise a dangling pointer will result.
+
+---
+ ext/spl/spl_array.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ext/spl/spl_array.c b/ext/spl/spl_array.c
+index 4f7c3a8..5e9fa5e 100644
+--- a/ext/spl/spl_array.c
++++ b/ext/spl/spl_array.c
+@@ -1770,13 +1770,11 @@ SPL_METHOD(Array, unserialize)
+ 
+ 	ALLOC_INIT_ZVAL(pflags);
+ 	if (!php_var_unserialize(&pflags, &p, s + buf_len, &var_hash TSRMLS_CC) || Z_TYPE_P(pflags) != IS_LONG) {
+-		zval_ptr_dtor(&pflags);
+ 		goto outexcept;
+ 	}
+ 
+ 	--p; /* for ';' */
+ 	flags = Z_LVAL_P(pflags);
+-	zval_ptr_dtor(&pflags);
+ 	/* flags needs to be verified and we also need to verify whether the next
+ 	 * thing we get is ';'. After that we require an 'm' or somethign else
+ 	 * where 'm' stands for members and anything else should be an array. If
+@@ -1826,10 +1824,18 @@ SPL_METHOD(Array, unserialize)
+ 	/* done reading $serialized */
+ 
+ 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
++	if (pflags) {
++		zval_ptr_dtor(&pflags);
++		pflags = NULL;
++	}
+ 	return;
+ 
+ outexcept:
+ 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
++	if (pflags) {
++		zval_ptr_dtor(&pflags);
++		pflags = NULL;
++	}
+ 	zend_throw_exception_ex(spl_ce_UnexpectedValueException, 0 TSRMLS_CC, "Error at offset %ld of %d bytes", (long)((char*)p - buf), buf_len);
+ 	return;
+ 
+-- 
+2.1.4
+
