@@ -1,0 +1,269 @@
+Summary
+-------
+
+By correctly crafting their input to `unserialize` an attacker can cause the
+`array` attibute of a SPL `ArrayObject` to be destroyed and not reinitialised.
+The `array` attribute is a `zval`, which after destruction will contain a number
+of dangling pointers. An attacker can trigger this bug and likely cause the
+deallocated attributes of the `zval` to be reallocated and initialized with data
+that they control. The outcome of this is that `spl_array_object->array` points
+to a forged `zval` structure and, as shown in prior research, an attacker likely
+has many paths from there towards code execution.
+
+This bug is similar in nature to #70068 (CVE-2015-6832) and so this report
+provides the essential details without delving too much into how an attacker
+could leverage the issue. If further information is required, please ask.
+
+Impact
+------
+
+This vulnerability can likely be leveraged to achieve code execution. Any
+application that calls `unserialize` on user provided data is potentially
+vulnerable.
+
+Patch
+-----
+
+There are two patches attached.
+
+One re-adds a check that was present in versions prior to 7.0, which prevents a
+"r"/reference type in a serialized object from referring to itself. I am
+presuming `php_var_unserialize_ex` is intended to guarantee a post-condition like
+"A return value of 1 indicates that the first argument has been initialized to a
+correctly deserialized zval", as it did in versions prior to 7.0.
+
+The other patch modifies `SPL_METHOD(Array, unserialize)` to correctly adhere to
+what I am presuming is a pre-condition of `php_var_unserialize_ex`. Namely, "The
+first argument will point to a zval which is correctly initialised and safe to
+use".
+
+It's worth noting that either of these patches on their own will prevent this
+particular bug, but both are, in my opinion, necessary to help prevent
+regressions.
+
+Without the first one then callers to `php_var_unserialize_ex` have no
+guarantees that the first argument will contain a valid `zval` representing the
+result of unserializing the provided string, even if 1 is returned. Without the
+second patch then this same call-site to `php_var_unserialize_ex` will run the
+risk in the future of again becoming a potential source of insecurity if there
+is ever a regression, or new problem, introduced in `php_var_unserialize_ex`,
+which results in 1 being returned without the first argument being correctly
+initialised.
+
+Bug Details
+-----------
+
+File: ext/spl/spl_array.c
+
+1722 SPL_METHOD(Array, unserialize)
+1723 {
+1724     spl_array_object *intern = Z_SPLARRAY_P(getThis());
+
+...
+
+1780         zval_ptr_dtor(&intern->array);
+1781         if (!php_var_unserialize(&intern->array, &p, s + buf_len, &var_hash)) {
+1782             goto outexcept;
+1783         }
+
+File: ext/standard/var_unserializer.re
+
+502 PHPAPI int php_var_unserialize_ex(UNSERIALIZE_PARAMETER)
+503 {
+
+...
+
+513
+514         if (var_hash && (*p)[0] != 'R') {
+515                 var_push(var_hash, rval);
+516         }
+
+On line 1780 of `ext/spl/spl_array.c` the `zval` `intern->array` is destroyed
+and its contained HashTable is deallocated. Its address is then passed as the
+first argument to `php_var_unserialize`, which eventually finds its way into the
+`rval` variable in `php_var_unserialize_ex`. The `var_push` function then pushes
+this value to the `var_hash` datastructure, which is used to maintain references
+to previously unserialized objects.
+
+I believe the assumption made pertaining to the safety of calling
+`php_var_unserialize` with a destroyed `zval` is that even though `var_hash`
+will be used to store this value, before `php_var_unserialize` returns the
+`zval` will be reinitialised. As it turns out, this assumption isn't true.
+
+File: ext/standard/var_unserializer.re
+
+548 "r:" iv ";"             {
+549         zend_long id;
+550
+551         *p = YYCURSOR;
+552         if (!var_hash) return 0;
+553
+554         id = parse_iv(start + 2) - 1;
+555         if (id == -1 || (rval_ref = var_access(var_hash, id)) == NULL) {
+556                 return 0;
+557         }
+558
+559         if (Z_ISUNDEF_P(rval_ref) || (Z_ISREF_P(rval_ref) &&
+Z_ISUNDEF_P(Z_REFVAL_P(rval_ref)))) {
+560                 ZVAL_UNDEF(rval);
+561                 return 1;
+562         }
+563
+564         ZVAL_COPY(rval, rval_ref);
+565
+566         return 1;
+567 }
+
+If the type being unserialized is a "r"/reference type then the above code will
+be executed. The `id` variable is the index in the `var_hash` to the object we
+wish to reference. There is no check to ensure that the ID isn't of the object
+which was just pushed to the `var_hash` on line 515, as mentioned above. In
+other words, by providing the correct index we can ensure that `rval_ref` and
+`rval` both reference the destroyed `zval`, `intern->array`.
+
+`ZVAL_COPY(rval, rval_ref)` is then effectively a no-op in terms of
+reinitialising `intern->array` (although because it does cause some heap
+corruption as it increments the `refcount` of the deallocated `HashTable` and
+that field now corresponds with heap meta-data). This problem does not seem to
+effect versions earlier than 7.0, as when handling "r"/reference types the code
+prevents the value just pushed to `var_hash` from being used as the referenced
+object. e.g. directly after line 557 above, something like the following exists:
+
+if (*rval == *rval_ref) return 0;
+
+After the above code is executed, on line 566 `php_var_unserialize` returns into
+`SPL_METHOD(Array, unserialize)` and `intern->array` remains in its destroyed
+state (complete with dangling pointers), while the heap is corrupted due to the
+modifications performed to by ZVAL_COPY to the memory which had been returned to
+the allocator.
+
+Providing the following input string to `unserialize` demonstrates the issue,
+while also triggering a segmentation fault.
+
+C:11:"ArrayObject":11:{x:i:0;r:3;X
+
+###############################################################################
+
+sean@ubuntu:~/Git/php-src$ gdb -q ./sapi/cli/php
+(gdb) b zim_spl_Array_unserialize
+Breakpoint 1 at 0x82cde25: file /home/sean/Git/php-src/ext/spl/spl_array.c, line 1723.
+(gdb) r ~/Projects/Fuzzing_2015/Phase_1/deserialise.php ~/Git/EntomologyPrivate/PHP/poc.sz
+Starting program: /home/sean/Git/php-src/sapi/cli/php ~/Projects/Fuzzing_2015/Phase_1/deserialise.php ~/Git/EntomologyPrivate/PHP/poc.sz
+C:11:"ArrayObject":11:{x:i:0;r:3;X
+
+Breakpoint 1, zim_spl_Array_unserialize (execute_data=0xf6014180, return_value=0xffff9388) at /home/sean/Git/php-src/ext/spl/spl_array.c:1723
+1723	{
+(gdb) b 1780
+Breakpoint 2 at 0x82ce064: file /home/sean/Git/php-src/ext/spl/spl_array.c, line 1780.
+(gdb) c
+Continuing.
+
+Breakpoint 2, zim_spl_Array_unserialize (execute_data=0xf6014180, return_value=0xffff9388) at /home/sean/Git/php-src/ext/spl/spl_array.c:1780
+1780			zval_ptr_dtor(&intern->array);
+(gdb) p/x &intern->array
+$1 = 0xf605e3c0
+(gdb) p intern->array
+$2 = {value = {lval = -167419280, dval = 2.0392796762657958e-314, counted = 0xf6056270, str = 0xf6056270, arr = 0xf6056270, obj = 0xf6056270, res = 0xf6056270,
+    ref = 0xf6056270, ast = 0xf6056270, zv = 0xf6056270, ptr = 0xf6056270, ce = 0xf6056270, func = 0xf6056270, ww = {w1 = 4127548016, w2 = 0}}, u1 = {v = {type = 7 '\a',
+      type_flags = 28 '\034', const_flags = 0 '\000', reserved = 0 '\000'}, type_info = 7175}, u2 = {var_flags = 0, next = 0, cache_slot = 0, lineno = 0, num_args = 0,
+    fe_pos = 0, fe_iter_idx = 0, access_flags = 0}}
+
+Note the address of the `zval` itself, 0xf605e3c0, as well as the child object
+contained within it, 0xf6056270. We have hit a breakpoint at the line
+`zval_ptr_dtor(&intern->array);`. If we set a breakpoint on the _efree_48, and
+step over, we see the child object being returned to the heap.
+
+(gdb) b _efree_48
+Breakpoint 3 at 0x841c0b3: file /home/sean/Git/php-src/Zend/zend_alloc.c, line 2403.
+(gdb) n
+
+Breakpoint 3, _efree_48 (ptr=0xf6056270) at /home/sean/Git/php-src/Zend/zend_alloc.c:2403
+
+...
+
+The address of `intern->array` is then passed to `php_var_unserialize`.
+
+(gdb)
+php_var_unserialize_ex (rval=0xf605e3c0, p=0xffff90b4, max=0xf60557db "", var_hash=0xffff90b8, classes=0x0) at ext/standard/var_unserializer.re:503
+503	{
+
+...
+
+As described in the bug description, `rval` and `rval_ref` end up both referring
+to the `intern->array` `zval`.
+
+(gdb)
+564		ZVAL_COPY(rval, rval_ref);
+(gdb) p/x rval
+$4 = 0xf605e3c0
+(gdb) p/x rval_ref
+$5 = 0xf605e3c0
+
+And intern->array still references the deallocated child object.
+
+(gdb) p *rval
+$6 = {value = {lval = -167419280, dval = 2.0392796762657958e-314, counted = 0xf6056270, str = 0xf6056270, arr = 0xf6056270, obj = 0xf6056270, res = 0xf6056270,
+    ref = 0xf6056270, ast = 0xf6056270, zv = 0xf6056270, ptr = 0xf6056270, ce = 0xf6056270, func = 0xf6056270, ww = {w1 = 4127548016, w2 = 0}}, u1 = {v = {type = 7 '\a',
+      type_flags = 28 '\034', const_flags = 0 '\000', reserved = 0 '\000'}, type_info = 7175}, u2 = {var_flags = 0, next = 0, cache_slot = 0, lineno = 0, num_args = 0,
+    fe_pos = 0, fe_iter_idx = 0, access_flags = 0}}
+
+We can see that the first field of the child object, the refcount, has been
+corrupted by the process of returning it to the heap. When it is returned to the
+heap this field is overwritten by a pointer to another heap chunk.
+
+(gdb) p/x *rval->value->counted
+$9 = {gc = {refcount = 0xf60562a0, u = {v = {type = 0x1, flags = 0x0, gc_info = 0x8000}, type_info = 0x80000001}}}
+
+And as mentioned above, the ZVAL_COPY in turn corrupts this heap metadata by
+treating it as if it was still a reference counter, and incrementing it.
+
+(gdb) n
+566		return 1;
+(gdb) p/x *rval->value->counted
+$10 = {gc = {refcount = 0xf60562a1, u = {v = {type = 0x1, flags = 0x0, gc_info = 0x8000}, type_info = 0x80000001}}}
+
+The corruption/confusion created by the above sequence of events will eventually
+lead to a segmentation fault.
+
+(gdb) c
+Continuing.
+
+Program received signal SIGSEGV, Segmentation fault.
+0x0841a5dd in zend_mm_alloc_small (bin_num=5, size=48, heap=0xf6000040) at /home/sean/Git/php-src/Zend/zend_alloc.c:1291
+1291			heap->free_slot[bin_num] = p->next_free_slot;
+
+(gdb) bt
+#0  0x0841a5dd in zend_mm_alloc_small (bin_num=5, size=48, heap=0xf6000040) at /home/sean/Git/php-src/Zend/zend_alloc.c:1291
+#1  _emalloc_48 () at /home/sean/Git/php-src/Zend/zend_alloc.c:2361
+#2  0x084596ae in _array_init (arg=0xffff8edc, size=1) at /home/sean/Git/php-src/Zend/zend_API.c:1063
+#3  0x08485944 in debug_backtrace_get_args (call=0xf6014180, arg_array=0xffff8edc) at /home/sean/Git/php-src/Zend/zend_builtin_functions.c:2242
+#4  0x084868d4 in zend_fetch_debug_backtrace (return_value=0xffff8f4c, skip_last=0, options=0, limit=0) at /home/sean/Git/php-src/Zend/zend_builtin_functions.c:2627
+#5  0x0848d81e in zend_default_exception_new_ex (class_type=0x8b25538, skip_top_traces=0) at /home/sean/Git/php-src/Zend/zend_exceptions.c:213
+#6  0x0848d96d in zend_default_exception_new (class_type=0x8b25538) at /home/sean/Git/php-src/Zend/zend_exceptions.c:236
+#7  0x0845a4b3 in _object_and_properties_init (arg=0xffff900c, class_type=0x8b25538, properties=0x0) at /home/sean/Git/php-src/Zend/zend_API.c:1304
+#8  0x0845a4f3 in _object_init_ex (arg=0xffff900c, class_type=0x8b25538) at /home/sean/Git/php-src/Zend/zend_API.c:1312
+#9  0x08494551 in zend_throw_exception (exception_ce=0x8b25538, message=0xf605e410 "Error at offset 10 of 11 bytes", code=0)
+    at /home/sean/Git/php-src/Zend/zend_exceptions.c:878
+#10 0x0849461f in zend_throw_exception_ex (exception_ce=0x8b25538, code=0, format=0x8991c84 "Error at offset %pd of %d bytes")
+    at /home/sean/Git/php-src/Zend/zend_exceptions.c:902
+#11 0x082ce293 in zim_spl_Array_unserialize (execute_data=0xf6014180, return_value=0xffff9388) at /home/sean/Git/php-src/ext/spl/spl_array.c:1811
+#12 0x0843d03d in zend_call_function (fci=0xffff93cc, fci_cache=0xffff9398) at /home/sean/Git/php-src/Zend/zend_execute_API.c:879
+#13 0x0848b3b6 in zend_call_method (object=0xf60140f0, obj_ce=0x8b302c0, fn_proxy=0x8b3039c, function_name=0x89c81dd "unserialize", function_name_len=11, retval_ptr=0x0,
+    param_count=1, arg1=0xffff947c, arg2=0x0) at /home/sean/Git/php-src/Zend/zend_interfaces.c:104
+#14 0x0848c39a in zend_user_unserialize (object=0xf60140f0, ce=0x8b302c0, buf=0xf606213f "x:i:0;r:3;X\n", buf_len=11, data=0xffff97ac)
+    at /home/sean/Git/php-src/Zend/zend_interfaces.c:460
+#15 0x08390868 in object_custom (rval=0xf60140f0, p=0xffff97a8, max=0xf606214b "", var_hash=0xffff97ac, classes=0x0, ce=0x8b302c0) at ext/standard/var_unserializer.re:425
+#16 0x083921ce in php_var_unserialize_ex (rval=0xf60140f0, p=0xffff97a8, max=0xf606214b "", var_hash=0xffff97ac, classes=0x0) at ext/standard/var_unserializer.re:844
+#17 0x0837e11b in zif_unserialize (execute_data=0xf6014140, return_value=0xf60140f0) at /home/sean/Git/php-src/ext/standard/var.c:1038
+
+...
+
+###############################################################################
+
+From an attackers point of view the remaining work is to get the the deallocated
+child object reallocated using data which they control and then to trigger its
+use. As this bug is similar in nature to a variety of others previously
+reported, and in particular to CVE-2015-6832, I have not included a trigger for
+this outcome. If one is required, let me know.
+
+EOF

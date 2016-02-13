@@ -1,0 +1,25 @@
+From c70e533fdbc4e4134ad12c1e596516542fd230ad Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean.heelan@gmail.com>
+Date: Thu, 7 Jan 2016 13:37:39 +0000
+Subject: [PATCH] After the array is destroyed mark the zval's type as
+ undefined
+
+---
+ ext/spl/spl_array.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/ext/spl/spl_array.c b/ext/spl/spl_array.c
+index 1f4cad1..67d2ccb 100644
+--- a/ext/spl/spl_array.c
++++ b/ext/spl/spl_array.c
+@@ -1778,6 +1778,7 @@ SPL_METHOD(Array, unserialize)
+ 		intern->ar_flags &= ~SPL_ARRAY_CLONE_MASK;
+ 		intern->ar_flags |= flags & SPL_ARRAY_CLONE_MASK;
+ 		zval_ptr_dtor(&intern->array);
++		ZVAL_UNDEF(&intern->array);
+ 		if (!php_var_unserialize(&intern->array, &p, s + buf_len, &var_hash)) {
+ 			goto outexcept;
+ 		}
+-- 
+2.1.4
+

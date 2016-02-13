@@ -1,0 +1,27 @@
+From 6e8400cd029b59229552bc9af237e67ae38c8811 Mon Sep 17 00:00:00 2001
+From: Sean Heelan <sean.heelan@gmail.com>
+Date: Thu, 7 Jan 2016 13:46:16 +0000
+Subject: [PATCH] Mark the entry and inf zval's as undefined after their
+ references have been released
+
+---
+ ext/spl/spl_observer.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/ext/spl/spl_observer.c b/ext/spl/spl_observer.c
+index 154a3c0..e8d6074 100644
+--- a/ext/spl/spl_observer.c
++++ b/ext/spl/spl_observer.c
+@@ -821,7 +821,9 @@ SPL_METHOD(SplObjectStorage, unserialize)
+ 		var_replace(&var_hash, &entry, &element->obj);
+ 		var_replace(&var_hash, &inf, &element->inf);
+ 		zval_ptr_dtor(&entry);
++		ZVAL_UNDEF(&entry);
+ 		zval_ptr_dtor(&inf);
++		ZVAL_UNDEF(&inf);
+ 	}
+ 
+ 	if (*p != ';') {
+-- 
+2.1.4
+

